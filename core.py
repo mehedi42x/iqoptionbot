@@ -1,428 +1,287 @@
 """
-Core Trading Controller & Orchestrator
-Acts as the central bridge between bot.py, Strategies, and the API layer.
-Handles data fetching based on strategy requirements, validation, execution, and trade monitoring.
-Contains NO hardcoded market analysis or strategy indicator formulas.
+core.py - Central Engine and Orchestrator
 """
 
-import sys
-import os
+import importlib
 import json
-import time
 import logging
-from typing import Dict, Any, Optional, List, Tuple
+import os
+import threading
+import time
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
-# API modules
-from api.auth import IQAuth
+from api.auth import IQOptionAuth
 from api.binary import BinaryAPI
+from api.bliz import BlizAPI
 from api.digital import DigitalAPI
 from api.Marginal import MarginalAPI
-from api.bliz import BlizAPI
 
-# Strategy modules
-from Strategies.short_term_option_scalper import ShortTermOptionScalper
-from Strategies.short_term_option_reversal import ShortTermOptionReversal
-from Strategies.marginal_gold_scalper import MarginalGoldScalper
-from Strategies.marginal_breakout_pro import MarginalBreakoutPro
-from Strategies.marginal_momentum_reversal import MarginalMomentumReversal
-
-logger = logging.getLogger("CoreTradingBridge")
+logger = logging.getLogger("IQ_BOT.Core")
 
 
-class CoreController:
+class TradingEngine:
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.running = False
+        self._stop_requested = threading.Event()
 
-        # Resolve Strategy & Aliases
-        self.strategy_name = self.config.get("STRATEGY", "").lower().strip()
-        if self.strategy_name == "leverage":
-            self.strategy_name = "marginal_gold_scalper"
+        self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.case_dir = os.path.join(self.base_dir, "case")
+        os.makedirs(self.case_dir, exist_ok=True)
+        self.trades_file = os.path.join(self.case_dir, "trades.json")
+        self.state_file = os.path.join(self.case_dir, "state.json")
+        self.summary_file = os.path.join(self.case_dir, "summary.json")
 
-        self.strategy = self._initialize_strategy(self.strategy_name)
+        self.starting_balance: float = 0.0
+        self.current_balance: float = 0.0
+        self.active_trades: List[Dict[str, Any]] = []
+        self.last_candle_timestamp: Optional[int] = None
+        self._trade_lock = threading.Lock()
 
-        # Initialize Auth & API layer
-        self.auth = IQAuth(
-            email=self.config.get("IQ_EMAIL", ""),
-            password=self.config.get("IQ_PASSWORD", ""),
-            account_type=self.config.get("ACCOUNT", "PRACTICE")
+        self.strategy_module = importlib.import_module(f"Strategies.{config.get('STRATEGY')}")
+        self.auth = IQOptionAuth(
+            email=config.get("IQ_EMAIL", ""),
+            password=config.get("IQ_PASSWORD", ""),
+            account_type=config.get("ACCOUNT", "PRACTICE"),
         )
+        self.api = self._initialize_trade_api()
 
-        self.api_binary = BinaryAPI(self.auth)
-        self.api_digital = DigitalAPI(self.auth)
-        self.api_marginal = MarginalAPI(self.auth)
-        self.api_bliz = BlizAPI(self.auth)
+    def _initialize_trade_api(self):
+        t_type = self.config.get("TRADE_TYPE", "FOREX").upper()
+        if t_type == "BINARY":
+            return BinaryAPI(self.auth)
+        elif t_type == "DIGITAL":
+            return DigitalAPI(self.auth)
+        elif t_type in ["FOREX", "MARGINAL"]:
+            return MarginalAPI(self.auth)
+        elif t_type == "BLIZ":
+            return BlizAPI(self.auth)
+        raise ValueError(f"Unknown TRADE_TYPE: {t_type}")
 
-        # State tracking
-        self.open_trades: List[Dict[str, Any]] = []
-        self.closed_trades: List[Dict[str, Any]] = []
-        self.total_pnl: float = 0.0
-        self.wins: int = 0
-        self.losses: int = 0
-        self.ties: int = 0
-        self.session_file = os.path.join(os.path.dirname(__file__), "case", "session_trades.json")
+    def initialize(self) -> bool:
+        if not self.auth.connect_ws():
+            return False
+        self.starting_balance = self.auth.get_balance()
+        self.current_balance = self.starting_balance
+        self._update_state(connection_state="INITIALIZED")
+        self._update_summary()
+        return True
 
-        self._ensure_case_dir()
+    def start(self):
+        self.running = True
+        timeframe_sec = int(self.config.get("TIMEFRAME", 1)) * 60
+        symbol = self.config.get("SYMBOL", "XAUUSD")
 
-    def _ensure_case_dir(self):
-        case_dir = os.path.join(os.path.dirname(__file__), "case")
-        os.makedirs(case_dir, exist_ok=True)
+        while not self._stop_requested.is_set():
+            try:
+                if not self.auth.is_connected:
+                    self.auth.connect_ws()
 
-    def _initialize_strategy(self, strategy_name: str):
-        strategies_map = {
-            "short_term_option_scalper": ShortTermOptionScalper,
-            "short_term_option_reversal": ShortTermOptionReversal,
-            "marginal_gold_scalper": MarginalGoldScalper,
-            "marginal_breakout_pro": MarginalBreakoutPro,
-            "marginal_momentum_reversal": MarginalMomentumReversal
-        }
+                self.current_balance = self.auth.get_balance()
+                self._monitor_active_trades()
 
-        strategy_cls = strategies_map.get(strategy_name)
-        if not strategy_cls:
-            raise ValueError(f"Unknown or unsupported strategy: {strategy_name}")
+                max_open = int(self.config.get("MAX_OPEN_TRADES", 1))
+                with self._trade_lock:
+                    if len(self.active_trades) >= max_open:
+                        time.sleep(2)
+                        continue
 
-        return strategy_cls()
+                candles = self.api.get_candles(symbol, timeframe_seconds=timeframe_sec, count=120)
+                if not candles or len(candles) < 30:
+                    time.sleep(2)
+                    continue
 
-    def validate_setup(self) -> Tuple[bool, str]:
-        """
-        Validate strategy compatibility with trade type and configuration parameters.
-        """
-        trade_type = self.config.get("TRADE_TYPE", "").upper()
-        if trade_type not in self.strategy.compatible_trade_types:
-            return False, f"Strategy '{self.strategy_name}' is not compatible with TRADE_TYPE '{trade_type}'. Compatible types: {self.strategy.compatible_trade_types}"
+                latest_time = candles[-1].get("from", 0)
+                if self.last_candle_timestamp == latest_time:
+                    time.sleep(1)
+                    continue
+
+                signal = self.strategy_module.analyze({
+                    "candles": candles,
+                    "current_price": candles[-1]["close"],
+                    "symbol": symbol,
+                })
+                self.last_candle_timestamp = latest_time
+                self._update_state(last_signal=signal)
+
+                if signal in ["BUY", "SELL"]:
+                    logger.info(f"Signal: [{signal}] on {symbol} @ {candles[-1]['close']}")
+                    self._execute_signal(signal, candles[-1]["close"])
+
+            except Exception as e:
+                logger.error(f"Engine Loop Exception: {e}")
+            time.sleep(1)
+
+    def _execute_signal(self, signal: str, current_price: float):
+        symbol = self.config.get("SYMBOL", "XAUUSD")
+        amount = float(self.config.get("AMOUNT", 10.0))
+        trade_type = self.config.get("TRADE_TYPE", "FOREX").upper()
 
         if trade_type in ["FOREX", "MARGINAL"]:
-            exec_time = self.config.get("EXECUTION_TIME")
-            if exec_time and str(exec_time).strip() != "":
-                return False, "EXECUTION_TIME must be blank for FOREX/MARGINAL trading."
-            leverage = self.config.get("LEVERAGE")
-            if not leverage or int(leverage) <= 0:
-                return False, "LEVERAGE must be a positive integer for FOREX/MARGINAL."
+            lev = int(self.config.get("LEVERAGE", 10))
+            sl_dist = float(self.config.get("STOP_LOSS", 2.0))
+            tp_dist = float(self.config.get("TAKE_PROFIT", 4.0))
+
+            sl_price = round(current_price - sl_dist, 4) if signal == "BUY" else round(current_price + sl_dist, 4)
+            tp_price = round(current_price + tp_dist, 4) if signal == "BUY" else round(current_price - tp_dist, 4)
+
+            res = self.api.place_order(symbol, signal, amount, lev, sl_price, tp_price)
+            if res.get("success"):
+                trade_record = {
+                    "trade_id": str(res.get("position_id")),
+                    "symbol": symbol,
+                    "trade_type": trade_type,
+                    "strategy": self.config.get("STRATEGY"),
+                    "direction": signal,
+                    "amount": amount,
+                    "leverage": lev,
+                    "entry_price": res.get("entry_price", current_price),
+                    "exit_price": None,
+                    "stop_loss": sl_price,
+                    "take_profit": tp_price,
+                    "open_time": datetime.now(timezone.utc).isoformat(),
+                    "close_time": None,
+                    "execution_time": None,
+                    "result": "PENDING",
+                    "pnl": 0.0,
+                    "status": "OPEN",
+                }
+                with self._trade_lock:
+                    self.active_trades.append(trade_record)
+                self._update_state()
+
         else:
-            exec_time = self.config.get("EXECUTION_TIME")
-            if not exec_time:
-                return False, f"EXECUTION_TIME is required for {trade_type}."
+            exec_time = int(self.config.get("EXECUTION_TIME", 1) or 1)
+            res = self.api.place_order(symbol, signal, amount, exec_time)
+            if res.get("success"):
+                trade_record = {
+                    "trade_id": str(res.get("order_id")),
+                    "symbol": symbol,
+                    "trade_type": trade_type,
+                    "strategy": self.config.get("STRATEGY"),
+                    "direction": signal,
+                    "amount": amount,
+                    "entry_price": res.get("entry_price", current_price),
+                    "exit_price": None,
+                    "stop_loss": None,
+                    "take_profit": None,
+                    "open_time": datetime.now(timezone.utc).isoformat(),
+                    "close_time": None,
+                    "execution_time": exec_time,
+                    "result": "PENDING",
+                    "pnl": 0.0,
+                    "status": "OPEN",
+                }
+                with self._trade_lock:
+                    self.active_trades.append(trade_record)
+                self._update_state()
+                threading.Thread(target=self._wait_and_settle_option, args=(trade_record,), daemon=True).start()
 
-        return True, "Setup validated successfully"
+    def _wait_and_settle_option(self, trade_record: Dict[str, Any]):
+        trade_id = int(trade_record["trade_id"])
+        result = self.api.wait_for_result(trade_id)
+        trade_record["status"] = "CLOSED"
+        trade_record["result"] = result.get("result", "UNKNOWN")
+        trade_record["pnl"] = result.get("pnl", 0.0)
+        trade_record["exit_price"] = result.get("exit_price")
+        trade_record["close_time"] = datetime.now(timezone.utc).isoformat()
 
-    def connect(self) -> Tuple[bool, str]:
-        """
-        Connect to IQ Option via auth module.
-        """
-        return self.auth.connect()
+        with self._trade_lock:
+            self.active_trades = [t for t in self.active_trades if t["trade_id"] != str(trade_id)]
+        self._record_closed_trade(trade_record)
+        self._update_state()
+        self._update_summary()
 
-    def fetch_market_data(self) -> Optional[Dict[str, Any]]:
-        """
-        Fetch market data required by the active strategy using the correct API module.
-        Enforces strict 'NO DATA = NO TRADE' rule.
-        """
-        reqs = self.strategy.get_requirements()
-        timeframe = reqs.get("timeframe", 60)
-        candle_count = reqs.get("candle_count", 30)
-        symbol = self.config.get("SYMBOL", "XAUUSD")
-        trade_type = self.config.get("TRADE_TYPE", "FOREX").upper()
-
-        if not self.auth.check_connection():
-            if not self.auth.reconnect():
-                print("[CORE] Trade skipped: API connection unavailable.")
-                return None
-
-        # Fetch candles via corresponding API module
-        candles = []
-        current_price = None
-
-        if trade_type == "BINARY":
-            candles = self.api_binary.get_candles(symbol, timeframe, candle_count)
-            current_price = self.api_binary.get_realtime_price(symbol)
-        elif trade_type == "DIGITAL":
-            candles = self.api_digital.get_candles(symbol, timeframe, candle_count)
-            current_price = self.api_digital.get_realtime_price(symbol)
-        elif trade_type in ["FOREX", "MARGINAL"]:
-            candles = self.api_marginal.get_candles(symbol, timeframe, candle_count)
-            current_price = self.api_marginal.get_realtime_price(symbol)
-        elif trade_type == "BLIZ":
-            candles = self.api_bliz.get_candles(symbol, timeframe, candle_count)
-            current_price = self.api_bliz.get_realtime_price(symbol)
-
-        # Validation Rule: NO DATA = NO TRADE
-        if not candles:
-            print("[CORE] Trade skipped: Required candle data unavailable.")
-            return None
-
-        if len(candles) < (candle_count * 0.7):
-            print(f"[CORE] Trade skipped: Insufficient historical candles ({len(candles)}/{candle_count}).")
-            return None
-
-        if current_price is None or current_price <= 0:
-            print("[CORE] Trade skipped: Current price unavailable.")
-            return None
-
-        # Validate freshness (candle timestamp must not be excessively stale)
-        last_candle_time = candles[-1].get("to", candles[-1].get("at", 0))
-        now = time.time()
-        if last_candle_time > 0 and (now - last_candle_time) > 300:
-            print(f"[CORE] Trade skipped: Market data is stale (age: {int(now - last_candle_time)}s).")
-            return None
-
-        return {
-            "symbol": symbol,
-            "current_price": current_price,
-            "candles": candles,
-            "timestamp": now
-        }
-
-    def evaluate_and_trade(self):
-        """
-        Main execution cycle: Market Data -> Strategy Analysis -> Validation -> API Order -> Monitoring.
-        """
-        max_open = int(self.config.get("MAX_OPEN_TRADES", 1))
-        if len(self.open_trades) >= max_open:
-            # Skip placing new trades while max limit is reached
+    def _monitor_active_trades(self):
+        if self.config.get("TRADE_TYPE", "FOREX").upper() not in ["FOREX", "MARGINAL"]:
             return
+        with self._trade_lock:
+            active_copy = list(self.active_trades)
 
-        # 1. Gather Market Data
-        market_data = self.fetch_market_data()
-        if not market_data:
-            return
+        for trade in active_copy:
+            pos_id = int(trade["trade_id"])
+            pos_info = self.api.get_position_status(pos_id)
+            if pos_info and pos_info.get("status") == "CLOSED":
+                trade["status"] = "CLOSED"
+                trade["result"] = pos_info.get("result", "UNKNOWN")
+                trade["pnl"] = pos_info.get("pnl", 0.0)
+                trade["exit_price"] = pos_info.get("exit_price")
+                trade["close_time"] = datetime.now(timezone.utc).isoformat()
 
-        # 2. Query Strategy for Signal
-        signal = self.strategy.analyze(market_data)
+                with self._trade_lock:
+                    self.active_trades = [t for t in self.active_trades if t["trade_id"] != str(pos_id)]
+                self._record_closed_trade(trade)
+                self._update_state()
+                self._update_summary()
 
-        # 3. Validate Strategy Output
-        action = signal.get("action", "NO_SIGNAL").upper()
-        if action in ["NO_SIGNAL", "NONE", ""]:
-            return
+    def _record_closed_trade(self, trade_record: Dict[str, Any]):
+        try:
+            trades = []
+            if os.path.exists(self.trades_file):
+                with open(self.trades_file, "r") as f:
+                    trades = json.load(f)
+            trades.append(trade_record)
+            with open(self.trades_file, "w") as f:
+                json.dump(trades, f, indent=2)
+        except Exception as e:
+            logger.error(f"Error saving trade record: {e}")
 
-        trade_type = self.config.get("TRADE_TYPE", "FOREX").upper()
-        symbol = self.config.get("SYMBOL", "XAUUSD")
-        amount = float(self.config.get("AMOUNT", 10))
-
-        balance = self.auth.get_balance()
-        if balance < amount:
-            print(f"[CORE] Trade skipped: Insufficient account balance (${balance:.2f} < ${amount:.2f}).")
-            return
-
-        # Option Trade Validation & Execution
-        if trade_type in ["BINARY", "DIGITAL", "BLIZ"]:
-            if action not in ["CALL", "PUT"]:
-                print(f"[CORE] Trade skipped: Strategy signal validation failed ({action}).")
-                return
-
-            exec_time = int(self.config.get("EXECUTION_TIME", 1))
-            print(f"\n[SIGNAL DETECTED] Action: {action} | Asset: {symbol} | Confidence: {signal.get('confidence', 0):.2f}")
-            print(f"[STRATEGY REASON] {signal.get('reason', 'N/A')}")
-
-            success = False
-            trade_id = None
-            info = None
-
-            if trade_type == "BINARY":
-                success, trade_id, info = self.api_binary.execute_trade(symbol, amount, action, exec_time)
-            elif trade_type == "DIGITAL":
-                success, trade_id, info = self.api_digital.execute_trade(symbol, amount, action, exec_time)
-            elif trade_type == "BLIZ":
-                success, trade_id, info = self.api_bliz.execute_trade(symbol, amount, action, exec_time)
-
-            if success and info:
-                info["trade_type"] = trade_type
-                info["reason"] = signal.get("reason")
-                self.open_trades.append(info)
-                print(f"[CORE] Order successfully executed | ID: {trade_id} | Amount: ${amount} | Expiration: {exec_time}m")
-                self._save_session_state()
-            else:
-                print(f"[CORE] Trade skipped: Broker rejected order -> {trade_id}")
-
-        # Forex / Marginal Trade Validation & Execution
-        elif trade_type in ["FOREX", "MARGINAL"]:
-            if action not in ["BUY", "SELL"]:
-                print(f"[CORE] Trade skipped: Strategy signal validation failed ({action}).")
-                return
-
-            stop_loss = signal.get("stop_loss")
-            take_profit = signal.get("take_profit")
-            current_price = market_data["current_price"]
-
-            # SL / TP Validation
-            if action == "BUY":
-                if stop_loss is not None and stop_loss >= current_price:
-                    print(f"[CORE] Trade skipped: Invalid SL/TP (BUY SL {stop_loss} >= Price {current_price}).")
-                    return
-                if take_profit is not None and take_profit <= current_price:
-                    print(f"[CORE] Trade skipped: Invalid SL/TP (BUY TP {take_profit} <= Price {current_price}).")
-                    return
-            elif action == "SELL":
-                if stop_loss is not None and stop_loss <= current_price:
-                    print(f"[CORE] Trade skipped: Invalid SL/TP (SELL SL {stop_loss} <= Price {current_price}).")
-                    return
-                if take_profit is not None and take_profit >= current_price:
-                    print(f"[CORE] Trade skipped: Invalid SL/TP (SELL TP {take_profit} >= Price {current_price}).")
-                    return
-
-            leverage = int(self.config.get("LEVERAGE", 10))
-            print(f"\n[SIGNAL DETECTED] Action: {action} | Asset: {symbol} | Price: {current_price} | SL: {stop_loss} | TP: {take_profit}")
-            print(f"[STRATEGY REASON] {signal.get('reason', 'N/A')}")
-
-            success, pos_id, info = self.api_marginal.open_position(
-                symbol=symbol,
-                action=action,
-                amount=amount,
-                leverage=leverage,
-                stop_loss=stop_loss,
-                take_profit=take_profit
-            )
-
-            if success and info:
-                info["trade_type"] = trade_type
-                info["reason"] = signal.get("reason")
-                self.open_trades.append(info)
-                print(f"[CORE] Position opened | ID: {pos_id} | Amount: ${amount} | Leverage: {leverage}x")
-                self._save_session_state()
-            else:
-                print(f"[CORE] Trade skipped: Failed to open position -> {pos_id}")
-
-    def monitor_open_trades(self):
-        """
-        Monitor active positions, check expirations / SL / TP / Strategy early-exit rules.
-        """
-        if not self.open_trades:
-            return
-
-        remaining_trades = []
-        for trade in self.open_trades:
-            trade_type = trade.get("trade_type", "")
-            trade_id = trade.get("id") or trade.get("position_id")
-
-            # Monitoring Binary / Digital / Bliz Options
-            if trade_type in ["BINARY", "DIGITAL", "BLIZ"]:
-                open_time = trade.get("open_time", 0)
-                duration_secs = trade.get("duration", 1) * 60
-                elapsed = time.time() - open_time
-
-                if elapsed >= duration_secs:
-                    # Expiration reached, determine outcome
-                    status = "PENDING"
-                    pnl = 0.0
-
-                    if trade_type == "BINARY":
-                        status, pnl = self.api_binary.check_trade_result(trade_id)
-                    elif trade_type == "DIGITAL":
-                        status, pnl = self.api_digital.check_trade_result(trade_id)
-                    elif trade_type == "BLIZ":
-                        status, pnl = self.api_bliz.check_trade_result(trade_id)
-
-                    if status in ["WIN", "LOSE", "TIE"]:
-                        trade["status"] = status
-                        trade["pnl"] = pnl
-                        trade["close_time"] = time.time()
-                        self._record_trade_closure(trade)
-                        continue
-
-                remaining_trades.append(trade)
-
-            # Monitoring Forex / Marginal Positions
-            elif trade_type in ["FOREX", "MARGINAL"]:
-                pnl, current_price = self.api_marginal.get_position_pnl(trade_id, trade)
-                action = trade.get("action", "").lower()
-                sl = trade.get("stop_loss")
-                tp = trade.get("take_profit")
-
-                should_close = False
-                close_reason = ""
-
-                # Check Stop Loss / Take Profit triggers
-                if action == "buy":
-                    if sl and current_price <= sl:
-                        should_close = True
-                        close_reason = f"Stop Loss hit at {current_price:.2f}"
-                    elif tp and current_price >= tp:
-                        should_close = True
-                        close_reason = f"Take Profit hit at {current_price:.2f}"
-                elif action == "sell":
-                    if sl and current_price >= sl:
-                        should_close = True
-                        close_reason = f"Stop Loss hit at {current_price:.2f}"
-                    elif tp and current_price <= tp:
-                        should_close = True
-                        close_reason = f"Take Profit hit at {current_price:.2f}"
-
-                # Query Strategy for Early Exit condition
-                if not should_close and hasattr(self.strategy, "analyze_exit"):
-                    market_data = self.fetch_market_data()
-                    if market_data:
-                        exit_signal = self.strategy.analyze_exit(market_data, trade)
-                        if exit_signal.get("action") == "EXIT":
-                            should_close = True
-                            close_reason = exit_signal.get("reason", "Strategy early-exit condition triggered")
-
-                if should_close:
-                    success, res = self.api_marginal.close_position(trade_id)
-                    if success:
-                        trade["status"] = "CLOSED"
-                        trade["pnl"] = pnl
-                        trade["close_price"] = current_price
-                        trade["close_reason"] = close_reason
-                        trade["close_time"] = time.time()
-                        self._record_trade_closure(trade)
-                        continue
-
-                remaining_trades.append(trade)
-
-        self.open_trades = remaining_trades
-
-    def _record_trade_closure(self, trade: Dict[str, Any]):
-        pnl = trade.get("pnl", 0.0)
-        self.total_pnl += pnl
-        if pnl > 0:
-            self.wins += 1
-            outcome_str = f"WIN (+${pnl:.2f})"
-        elif pnl < 0:
-            self.losses += 1
-            outcome_str = f"LOSS (-${abs(pnl):.2f})"
-        else:
-            self.ties += 1
-            outcome_str = "TIE ($0.00)"
-
-        trade_id = trade.get("id") or trade.get("position_id")
-        print(f"\n[TRADE RESOLVED] ID: {trade_id} | Outcome: {outcome_str} | Total Session PnL: ${self.total_pnl:+.2f}")
-        self.closed_trades.append(trade)
-        self._save_session_state()
-
-    def _save_session_state(self):
-        """
-        Persist session trade log in case/ directory without passwords.
-        """
+    def _update_state(self, connection_state: Optional[str] = None, last_signal: Optional[str] = None):
         try:
             state = {
-                "strategy": self.strategy_name,
-                "symbol": self.config.get("SYMBOL"),
-                "account": self.config.get("ACCOUNT"),
-                "trade_type": self.config.get("TRADE_TYPE"),
-                "total_trades": len(self.closed_trades),
-                "wins": self.wins,
-                "losses": self.losses,
-                "ties": self.ties,
-                "total_pnl": round(self.total_pnl, 2),
-                "closed_trades": self.closed_trades
+                "active_trades": self.active_trades,
+                "open_position_ids": [t["trade_id"] for t in self.active_trades],
+                "last_processed_signal": last_signal,
+                "last_known_balance": self.current_balance,
+                "connection_state": connection_state or ("CONNECTED" if self.auth.is_connected else "DISCONNECTED"),
+                "last_updated": datetime.now(timezone.utc).isoformat(),
             }
-            with open(self.session_file, "w") as f:
+            with open(self.state_file, "w") as f:
                 json.dump(state, f, indent=2)
-        except Exception as e:
-            logger.error(f"Error saving session state: {e}")
+        except Exception:
+            pass
 
-    def shutdown(self):
-        """
-        Graceful shutdown routine upon SIGINT / Ctrl+C.
-        """
-        print("\n[CORE] Initiating graceful shutdown...")
+    def _update_summary(self):
+        try:
+            trades = []
+            if os.path.exists(self.trades_file):
+                with open(self.trades_file, "r") as f:
+                    trades = json.load(f)
+            total = len(trades)
+            wins = sum(1 for t in trades if t.get("result") == "WIN")
+            losses = sum(1 for t in trades if t.get("result") == "LOSS")
+            ties = sum(1 for t in trades if t.get("result") == "TIE")
+            win_rate = (wins / total * 100) if total > 0 else 0.0
+            total_pnl = sum(t.get("pnl", 0.0) for t in trades)
+
+            summary = {
+                "total_trades": total,
+                "winning_trades": wins,
+                "losing_trades": losses,
+                "tie_trades": ties,
+                "win_rate": round(win_rate, 2),
+                "starting_balance": round(self.starting_balance, 2),
+                "ending_balance": round(self.current_balance, 2),
+                "total_pnl": round(total_pnl, 2),
+            }
+            with open(self.summary_file, "w") as f:
+                json.dump(summary, f, indent=2)
+        except Exception:
+            pass
+
+    def get_summary(self) -> Dict[str, Any]:
+        try:
+            if os.path.exists(self.summary_file):
+                with open(self.summary_file, "r") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {}
+
+    def stop(self):
         self.running = False
-        if self.open_trades:
-            print(f"[CORE] Handling {len(self.open_trades)} active positions...")
-            for t in self.open_trades:
-                tid = t.get("position_id")
-                if tid and t.get("trade_type") in ["FOREX", "MARGINAL"]:
-                    print(f"[CORE] Auto-closing open position {tid} for safe shutdown...")
-                    self.api_marginal.close_position(tid)
-
-        self.auth.disconnect()
-        self._save_session_state()
-        print("[CORE] Disconnected safely. Session saved.")
+        self._stop_requested.set()
+        self._update_state(connection_state="STOPPED")
+        self._update_summary()
+        self.auth.close()
