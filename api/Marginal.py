@@ -1,6 +1,7 @@
 """
 api/Marginal.py
 Forex / Marginal / CFD API and WebSocket Trading Layer for IQ Option.
+Core handles Stop Loss and Take Profit by market tracking — broker receives NO sl/tp.
 """
 
 import logging
@@ -64,9 +65,13 @@ class MarginalAPI:
         direction: str,
         amount: float,
         leverage: int = 10,
-        stop_loss_price: Optional[float] = None,
-        take_profit_price: Optional[float] = None,
+        stop_loss_price: Optional[float] = None,   # kept for record-keeping only, NOT sent to broker
+        take_profit_price: Optional[float] = None,  # kept for record-keeping only, NOT sent to broker
     ) -> Dict[str, Any]:
+        """
+        Places a marginal/forex order WITHOUT sending stop_loss/take_profit to the broker.
+        The core engine handles SL/TP itself via market-price tracking.
+        """
         side = "buy" if direction.lower() in ["buy", "call", "long"] else "sell"
         active_id = self.get_active_id(symbol)
         instrument_id = self.get_instrument_id(symbol)
@@ -80,10 +85,12 @@ class MarginalAPI:
             "leverage": int(leverage),
             "type": "market",
         }
-        if stop_loss_price:
-            msg["stop_loss"] = {"type": "price", "value": round(float(stop_loss_price), 4)}
-        if take_profit_price:
-            msg["take_profit"] = {"type": "price", "value": round(float(take_profit_price), 4)}
+        # NOTE: stop_loss and take_profit are intentionally NOT sent.
+        # The core engine will track the market and close the trade when SL/TP is hit.
+
+        logger.info(
+            f"Placing Marginal Order: {symbol} | Side: {side.upper()} | Amount: ${amount} | Leverage: {leverage}x"
+        )
 
         res = self.auth.send_request("marginal-forex.place-order", msg, timeout=12.0)
         if res and res.get("msg"):
@@ -107,6 +114,23 @@ class MarginalAPI:
                 return {"success": True, **info}
 
         return {"success": False, "error": "Marginal order execution failed"}
+
+    def close_position(self, position_id: int) -> Dict[str, Any]:
+        """
+        Closes an open marginal/forex position by market.
+        Used by the core engine when SL or TP is hit.
+        """
+        logger.info(f"Closing Marginal Position #{position_id}...")
+        msg = {
+            "position_id": position_id,
+            "user_balance_id": self.auth.active_balance_id,
+        }
+        res = self.auth.send_request("marginal-forex.close-by-market", msg, timeout=10.0)
+        if res and res.get("is_ok", res.get("msg")) is not None:
+            logger.info(f"Position #{position_id} close request sent successfully.")
+            return {"success": True, "position_id": position_id}
+        logger.warning(f"Failed to close position #{position_id}: {res}")
+        return {"success": False, "position_id": position_id, "error": str(res)}
 
     def get_position_status(self, position_id: int) -> Optional[Dict[str, Any]]:
         with self._lock:

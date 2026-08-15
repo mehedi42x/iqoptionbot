@@ -10,13 +10,13 @@ A production-grade, modular, pure-Python automated trading bot for **IQ Option**
 IqOption/
 │
 ├── .env                              # Active environment configuration
-├── .env.example                      # Safe template configuration
 ├── bot.py                            # Main CLI controller, validation & display
 ├── core.py                           # Central trading engine & orchestrator
 ├── requirements.txt                  # Python dependencies
 ├── README.md                         # Full documentation
 │
-├── Strategies/                       # Modular Trading Strategies
+├── Strategies/                       # Modular Trading Strategies (auto-discovered)
+│   ├── __init__.py
 │   ├── short_term_option_scalper.py     # Binary/Digital/Bliz scalping
 │   ├── short_term_option_reversal.py    # Binary/Digital/Bliz wick reversal
 │   ├── marginal_gold_scalper.py         # Forex/Marginal XAUUSD 1m scalping
@@ -24,10 +24,11 @@ IqOption/
 │   └── marginal_momentum_reversal.py    # Forex/Marginal MACD + Stochastic reversal
 │
 ├── api/                              # Direct Protocol Layers
+│   ├── __init__.py
 │   ├── auth.py                          # HTTP login, SSID, WS session, balance manager
 │   ├── binary.py                        # Binary/Turbo options protocol
 │   ├── digital.py                       # Digital options protocol
-│   ├── Marginal.py                      # Forex/Marginal CFD protocol with SL/TP
+│   ├── Marginal.py                      # Forex/Marginal CFD protocol (bot-managed SL/TP)
 │   └── bliz.py                          # Bliz/Blitz fast options protocol
 │
 └── case/                             # Persistent Runtime Data
@@ -54,9 +55,29 @@ pip3 install -r requirements.txt
 
 ## ⚙️ Configuration (`.env`)
 
-Copy `.env.example` to `.env` and configure your settings:
 ```bash
-cp .env.example .env
+IQ_EMAIL=you@example.com
+IQ_PASSWORD=your_password
+
+SYMBOL=XAUUSD
+AMOUNT=10
+
+ACCOUNT=PRACTICE
+
+MODE=FOREX
+
+EXECUTION_TIME=60
+
+TIMEFRAME=1
+
+STRATEGY=marginal_gold_scalper
+
+LEVERAGE=10
+
+STOP_LOSS=2.00
+TAKE_PROFIT=4.00
+
+MAX_OPEN_TRADES=1
 ```
 
 ### Configuration Parameters
@@ -68,56 +89,129 @@ cp .env.example .env
 | `SYMBOL` | Trading Asset Symbol | `XAUUSD`, `EURUSD`, `GBPUSD`, `USDJPY` |
 | `AMOUNT` | Base Investment Amount | `10`, `50`, `100` |
 | `ACCOUNT` | Account Selection | `PRACTICE` (Demo) or `REAL` (Live) |
-| `TRADE_TYPE` | Trading Instrument Type | `BINARY`, `DIGITAL`, `FOREX`, `MARGINAL`, `BLIZ` |
-| `EXECUTION_TIME`| Expiration duration (min) | Binary/Bliz: `1,2,3,4,5` \| Digital: `1,5,15` \| Forex: `[blank]` |
-| `TIMEFRAME` | Candle timeframe (min) | `1`, `5`, `15` |
-| `STRATEGY` | Strategy module name | `marginal_gold_scalper`, `marginal_breakout_pro`, etc. |
+| `MODE` | Which trading API the core uses | `BINARY`, `DIGITAL`, `FOREX`, `MARGINAL`, `BLIZ` |
+| `EXECUTION_TIME` | Expiration duration (**seconds**) | `60` (1m), `120` (2m), `300` (5m), `900` (15m) |
+| `BLIZ_ACTIVE_ID` | (optional) override Bliz active_id | e.g. `2436` — falls back to the built-in map |
+| `TIMEFRAME` | Candle timeframe (minutes) | `1`, `5`, `15` |
+| `STRATEGY` | Strategy module name (auto-discovered) | `marginal_gold_scalper`, `marginal_breakout_pro`, etc. |
 | `LEVERAGE` | Multiplier for Forex/CFD | `10`, `20`, `50`, `100` |
 | `STOP_LOSS` | SL distance from entry | `2.00`, `5.00` |
 | `TAKE_PROFIT` | TP distance from entry | `4.00`, `10.00` |
 | `MAX_OPEN_TRADES`| Max concurrent positions | `1`, `2`, `5` |
 
+### MODE → API Mapping
+
+The `MODE` value in `.env` decides which API module `core.py` uses:
+
+| MODE | API Module | Trading Type |
+| :--- | :--- | :--- |
+| `BINARY` | `api/binary.py` | Binary / Turbo options |
+| `DIGITAL` | `api/digital.py` | Digital options |
+| `FOREX` | `api/Marginal.py` | Forex / Marginal CFD (continuous) |
+| `MARGINAL` | `api/Marginal.py` | Forex / Marginal CFD (continuous) |
+| `BLIZ` | `api/bliz.py` | Bliz / Blitz fast options |
+
 ---
 
-## 📈 Stop Loss & Take Profit Logic (Forex / Marginal)
+## 🛡️ Stop Loss & Take Profit — Bot-Managed (NOT Broker)
 
-For Forex and Marginal trading, strategies only output directional signals (`BUY` or `SELL`). `core.py` calculates the exact SL and TP prices using the distances configured in `.env`:
+This is the most important design decision of this bot:
 
-- **BUY (LONG)**:
-  - $\text{SL} = \text{Entry Price} - \text{STOP\_LOSS}$
-  - $\text{TP} = \text{Entry Price} + \text{TAKE\_PROFIT}$
-- **SELL (SHORT)**:
-  - $\text{SL} = \text{Entry Price} + \text{STOP\_LOSS}$
-  - $\text{TP} = \text{Entry Price} - \text{TAKE\_PROFIT}$
+> **The bot itself handles Stop Loss and Take Profit. SL/TP are NEVER sent to the broker.**
+> The broker does **not** auto-close positions at SL/TP — the bot tracks the live market price and closes the trade itself.
+
+### How it works (Forex / Marginal)
+
+1. When a `BUY` / `SELL` signal fires, `core.py` calculates SL/TP prices locally from `.env` distances:
+   - **BUY (LONG)**:
+     - `SL = Entry Price - STOP_LOSS`
+     - `TP = Entry Price + TAKE_PROFIT`
+   - **SELL (SHORT)**:
+     - `SL = Entry Price + STOP_LOSS`
+     - `TP = Entry Price - TAKE_PROFIT`
+2. `api/Marginal.py` opens the order **without** any SL/TP in the broker request.
+3. Every engine cycle, `core.py` fetches the live market price (`_monitor_active_trades_market_price`):
+   - If **price ≤ SL** (long) or **price ≥ SL** (short) → `STOP_LOSS` hit
+   - If **price ≥ TP** (long) or **price ≤ TP** (short) → `TAKE_PROFIT` hit
+4. On SL/TP hit, the bot calls `MarginalAPI.close_position()` (`marginal-forex.close-by-market`) to close the trade itself.
+
+> For fixed-expiry modes (BINARY / DIGITAL / BLIZ) SL/TP does not apply — the option expires automatically.
 
 ---
 
-## 🧠 Available Strategies
+## 🧩 Strategy System — Auto-Discovery
 
-### 1. `short_term_option_scalper`
-- **Instruments**: Binary, Digital, Bliz
-- **Indicators**: EMA 9, EMA 21, RSI (14), Stochastic (14, 3)
-- **Logic**: Identifies trend momentum alignments when EMA 9 crosses EMA 21, RSI is in the strong 52-70 zone, and Stochastic confirms continuation.
+**Anyone can add a strategy by simply dropping a `.py` file into `Strategies/`.**
 
-### 2. `short_term_option_reversal`
-- **Instruments**: Binary, Digital, Bliz
-- **Indicators**: Bollinger Bands (20, 2), RSI (14), Candlestick Wick Rejection
-- **Logic**: Captures exhaustion pin bars and hammer/shooting star wicks rejecting outer Bollinger Bands in overbought/oversold territories.
+No registry, no hardcoded list. `bot.py` scans the `Strategies/` package at startup and imports every module that exports an `analyze(data) -> str` function.
 
-### 3. `marginal_gold_scalper`
-- **Instruments**: Forex / Marginal (XAUUSD / Gold)
-- **Indicators**: EMA 20, EMA 50, EMA 200, MACD (12, 26, 9), ATR (14)
-- **Logic**: Trend-following pullback strategy. Uses EMA 200 as master trend filter, waits for dynamic pullback to EMA 20/50 support/resistance, and triggers on MACD histogram inflection.
+### How to write a custom strategy
 
-### 4. `marginal_breakout_pro`
-- **Instruments**: Forex / Marginal (Gold / Currency pairs)
-- **Indicators**: Donchian Channels (20-period High/Low), ATR Volatility Expansion
-- **Logic**: Enters when price cleanly breaks 20-period highs or lows with strong candle body volume and ATR volatility expansion.
+```python
+# Strategies/my_custom_strategy.py
+from typing import Any
 
-### 5. `marginal_momentum_reversal`
-- **Instruments**: Forex / Marginal (Gold / Currency pairs)
-- **Indicators**: MACD, Stochastic Oscillator, Price Action Engulfing
-- **Logic**: Catches reversal turning points with Stochastic oversold/overbought crosses combined with MACD histogram divergence and structural reversal candles.
+def analyze(data: Any) -> str:
+    """
+    data = {
+        "candles": [...],      # list of candle dicts
+        "current_price": 1234.5,
+        "symbol": "XAUUSD",
+    }
+    Return: 'BUY', 'SELL', or 'NO_SIGNAL'
+    """
+    candles = data["candles"]
+    # ... your logic ...
+    return "BUY"  # or "SELL" / "NO_SIGNAL"
+```
+
+Then set `STRATEGY=my_custom_strategy` in `.env`. The bot will detect it automatically.
+
+### Built-in Strategies
+
+1. **`short_term_option_scalper`** — Binary/Digital/Bliz · EMA 9/21, RSI(14), Stochastic(14,3)
+2. **`short_term_option_reversal`** — Binary/Digital/Bliz · Bollinger(20,2), RSI(14), wick rejection
+3. **`marginal_gold_scalper`** — Forex/Marginal · EMA 20/50/200, MACD, ATR(14)
+4. **`marginal_breakout_pro`** — Forex/Marginal · Donchian(20), ATR volatility expansion
+5. **`marginal_momentum_reversal`** — Forex/Marginal · MACD, Stochastic, engulfing
+
+---
+
+## ⏱️ Execution Time (in Seconds)
+
+`EXECUTION_TIME` is specified in **seconds**, not minutes:
+
+| Seconds | Duration |
+| :--- | :--- |
+| `60` | 1 minute |
+| `120` | 2 minutes |
+| `300` | 5 minutes |
+| `900` | 15 minutes |
+
+For Forex / Marginal modes, `EXECUTION_TIME` is ignored (positions run until SL/TP is hit).
+
+---
+
+## 🚀 Bliz Trading Protocol
+
+`api/bliz.py` implements the Bliz trading protocol exactly as specified:
+
+| Step | Request | Response / Stream |
+| :--- | :--- | :--- |
+| 1. Server time sync | `sendMessage` → `{ name: "get-servertime", version: "1.0" }` | `servertime { msg: <unix_ts> }` |
+| 2. Live quote subscribe | `subscribeMessage` → `{ name: "quote-generated", params: { routingFilters: { active_id } } }` | continuous `quote-generated { active_id, value, price, timestamp }` |
+| 3. Trade placement | `sendMessage` → `{ name: "binary-options.open-option", version: "2.0", body: { user_balance_id, active_id, option_type_id: 12, direction, expiration_size, expired, price, profit_percent, refund_value, value } }` | `option { id, active_id, amount }` |
+| 4. Balance update | — (auto) | `balance-changed { current_balance: { id, amount } }` |
+| 5. Trade result | — (auto) | `option-closed { id, win, status, profit_amount, close_price }` |
+| 6. Heartbeat | `ping { msg: <unix_ts> }` every 5s | `timeSync { msg: <unix_ts> }` |
+
+Key points:
+
+- **`value`** in the order payload always comes from the **live `quote-generated` subscription** — never calculated locally.
+- **`expired`** = broker server time + `expiration_size` (seconds) — synced via `get-servertime` before each order.
+- **`option_type_id: 12`** (Bliz), `profit_percent: 92`, `refund_value: 0`.
+- Results arrive automatically as `option-closed`; no polling needed.
+- If your broker uses a different `active_id` (e.g. `2436`), set `BLIZ_ACTIVE_ID` in `.env`.
 
 ---
 
@@ -136,7 +230,7 @@ Always test strategies first on `ACCOUNT=PRACTICE` before running with real fund
 ## 💾 Persistent Case Storage
 
 All runtime state and trading activity is logged persistently in the `case/` directory:
-- **`case/trades.json`**: Complete trade history including trade ID, symbol, direction, entry/exit prices, SL/TP, timestamps, win/loss status, and net PnL.
+- **`case/trades.json`**: Complete trade history including trade ID, symbol, direction, entry/exit prices, SL/TP, close reason (`STOP_LOSS` / `TAKE_PROFIT`), timestamps, win/loss status, and net PnL.
 - **`case/state.json`**: Current operational state, active open position IDs, connection status, and last processed signals.
 - **`case/summary.json`**: Real-time aggregated statistics (Total Trades, Wins, Losses, Ties, Win Rate %, Starting Balance, Ending Balance, Total PnL).
 

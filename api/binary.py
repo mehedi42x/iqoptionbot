@@ -57,18 +57,27 @@ class BinaryAPI:
                 return parsed
         return []
 
-    def calculate_expiration(self, execution_time_minutes: int) -> int:
+    def calculate_expiration(self, execution_time_seconds: int) -> int:
+        """
+        Calculates expiration timestamp for a binary option.
+        `execution_time_seconds` is in SECONDS (e.g. 60 = 1 minute).
+        Binary options expire on full-minute boundaries.
+        """
         server_time = self.auth.get_server_time()
-        duration_sec = max(1, int(execution_time_minutes)) * 60
+        duration_sec = max(1, int(execution_time_seconds))
         exp = math.floor(server_time) + duration_sec
         rem = exp % 60
         return exp + (60 - rem) if rem != 0 else exp
 
-    def place_order(self, symbol: str, direction: str, amount: float, execution_time_minutes: int = 1) -> Dict[str, Any]:
+    def place_order(self, symbol: str, direction: str, amount: float, execution_time_seconds: int = 60) -> Dict[str, Any]:
+        """
+        Places a binary option order.
+        `execution_time_seconds` is in SECONDS (e.g. 60 = 1 minute).
+        """
         active_id = self.get_active_id(symbol)
         opt_dir = "call" if direction.lower() in ["buy", "call"] else "put"
-        exp_time = self.calculate_expiration(execution_time_minutes)
-        type_id = 3 if execution_time_minutes <= 5 else 1
+        exp_time = self.calculate_expiration(execution_time_seconds)
+        type_id = 3 if execution_time_seconds <= 300 else 1
 
         msg = {
             "price": float(amount),

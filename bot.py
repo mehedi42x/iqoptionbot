@@ -1,12 +1,15 @@
 """
 bot.py - Main Command Line Controller
+Auto-discovers strategies and uses MODE from .env to select the trading API.
 """
 
 import os
 import signal
 import sys
 import logging
-from typing import Any, Dict, Optional
+import importlib
+import pkgutil
+from typing import Any, Dict, List, Optional
 
 try:
     from dotenv import load_dotenv
@@ -21,7 +24,7 @@ except ImportError:
                 if line and not line.startswith("#") and "=" in line:
                     k, v = line.split("=", 1)
                     if override or k.strip() not in os.environ:
-                        os.environ[k.strip()] = v.strip().strip("'\"")
+                        os.environ[k.strip()] = v.strip().strip("'\"'")
 
 from core import TradingEngine
 
@@ -32,15 +35,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger("IQ_BOT")
 
-VALID_TRADE_TYPES = ["BINARY", "DIGITAL", "FOREX", "MARGINAL", "BLIZ"]
+VALID_MODES = ["BINARY", "DIGITAL", "FOREX", "MARGINAL", "BLIZ"]
 VALID_ACCOUNTS = ["PRACTICE", "REAL"]
-VALID_STRATEGIES = [
-    "short_term_option_scalper",
-    "short_term_option_reversal",
-    "marginal_gold_scalper",
-    "marginal_breakout_pro",
-    "marginal_momentum_reversal",
-]
+
+
+def discover_strategies() -> Dict[str, str]:
+    """
+    Auto-discovers strategy modules in the Strategies/ directory.
+    Scans for Python files that export an `analyze` function.
+    Returns a dict mapping strategy_name -> module_path.
+    """
+    strategies = {}
+    strategies_pkg = "Strategies"
+    try:
+        import Strategies as pkg
+        for importer, modname, ispkg in pkgutil.iter_modules(pkg.__path__):
+            if modname.startswith("_"):
+                continue
+            try:
+                module = importlib.import_module(f"{strategies_pkg}.{modname}")
+                if hasattr(module, "analyze") and callable(module.analyze):
+                    strategies[modname] = f"{strategies_pkg}.{modname}"
+                    logger.debug(f"Discovered strategy: {modname}")
+            except Exception as e:
+                logger.warning(f"Could not load strategy '{modname}': {e}")
+    except Exception as e:
+        logger.error(f"Failed to discover strategies: {e}")
+    return strategies
 
 
 def validate_config() -> Dict[str, Any]:
@@ -50,7 +71,10 @@ def validate_config() -> Dict[str, Any]:
     symbol = os.getenv("SYMBOL", "XAUUSD").strip().upper()
     amount = float(os.getenv("AMOUNT", "10"))
     account = os.getenv("ACCOUNT", "PRACTICE").strip().upper()
-    trade_type = os.getenv("TRADE_TYPE", "FOREX").strip().upper()
+    mode = os.getenv("MODE", "").strip().upper()
+    # Fallback to TRADE_TYPE if MODE is not set (backward compatibility)
+    if not mode:
+        mode = os.getenv("TRADE_TYPE", "FOREX").strip().upper()
     exec_time = os.getenv("EXECUTION_TIME", "").strip()
     timeframe = int(os.getenv("TIMEFRAME", "1"))
     strategy = os.getenv("STRATEGY", "marginal_gold_scalper").strip()
@@ -59,18 +83,30 @@ def validate_config() -> Dict[str, Any]:
     take_profit = float(os.getenv("TAKE_PROFIT", "4.00"))
     max_open = int(os.getenv("MAX_OPEN_TRADES", "1"))
 
+    if not email:
+        sys.exit("Error: IQ_EMAIL is missing in .env")
     if not password:
         sys.exit("Error: IQ_PASSWORD is missing in .env")
     if account not in VALID_ACCOUNTS:
-        sys.exit(f"Error: Invalid ACCOUNT '{account}'")
-    if trade_type not in VALID_TRADE_TYPES:
-        sys.exit(f"Error: Invalid TRADE_TYPE '{trade_type}'")
-    if strategy not in VALID_STRATEGIES:
-        sys.exit(f"Error: Strategy '{strategy}' not found in Strategies/")
+        sys.exit(f"Error: Invalid ACCOUNT '{account}'. Must be one of {VALID_ACCOUNTS}")
+    if mode not in VALID_MODES:
+        sys.exit(f"Error: Invalid MODE '{mode}'. Must be one of {VALID_MODES}")
+
+    # Auto-discover strategies and validate the selected one exists
+    available_strategies = discover_strategies()
+    if not available_strategies:
+        logger.warning("No strategies discovered in Strategies/ directory!")
+    elif strategy not in available_strategies:
+        logger.warning(
+            f"Strategy '{strategy}' not found in discovered strategies: {list(available_strategies.keys())}"
+        )
+        # Don't exit — allow runtime fallback; core will handle import error
+
+    logger.info(f"Configuration loaded — MODE={mode} STRATEGY={strategy} SYMBOL={symbol} ACCOUNT={account}")
 
     return {
         "IQ_EMAIL": email, "IQ_PASSWORD": password, "SYMBOL": symbol,
-        "AMOUNT": amount, "ACCOUNT": account, "TRADE_TYPE": trade_type,
+        "AMOUNT": amount, "ACCOUNT": account, "MODE": mode,
         "EXECUTION_TIME": exec_time, "TIMEFRAME": timeframe, "STRATEGY": strategy,
         "LEVERAGE": leverage, "STOP_LOSS": stop_loss, "TAKE_PROFIT": take_profit,
         "MAX_OPEN_TRADES": max_open,
