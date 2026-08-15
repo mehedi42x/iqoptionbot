@@ -137,7 +137,22 @@ class TradingEngine:
                     time.sleep(2)
                     continue
 
-                latest_time = candles[-1].get("from", 0)
+                # Optional secondary (signal) timeframe for multi-timeframe
+                # strategies such as the Bliz EMA crossover scalper.
+                signal_timeframe = getattr(self.strategy_module, "SIGNAL_TIMEFRAME", None)
+                signal_candles = None
+                if signal_timeframe:
+                    signal_candles = self.api.get_candles(
+                        symbol, timeframe_seconds=int(signal_timeframe), count=120
+                    )
+                    if not signal_candles or len(signal_candles) < 5:
+                        console.status(f"Loading {int(signal_timeframe)}s candle history...")
+                        time.sleep(1)
+                        continue
+                    latest_time = signal_candles[-1].get("from", 0)
+                else:
+                    latest_time = candles[-1].get("from", 0)
+
                 if self.last_candle_timestamp == latest_time:
                     console.status(self._waiting_status(symbol, timeframe_min))
                     time.sleep(1)
@@ -146,7 +161,10 @@ class TradingEngine:
                 console.status("Analyzing signal...")
                 signal = self.strategy_module.analyze({
                     "candles": candles,
-                    "current_price": candles[-1]["close"],
+                    "signal_candles": signal_candles,
+                    "current_price": (
+                        signal_candles[-1]["close"] if signal_candles else candles[-1]["close"]
+                    ),
                     "symbol": symbol,
                 })
                 self.last_candle_timestamp = latest_time

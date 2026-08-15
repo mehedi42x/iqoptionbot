@@ -20,6 +20,7 @@ IqOption/
 │   ├── __init__.py
 │   ├── short_term_option_scalper.py     # Binary/Digital/Bliz scalping
 │   ├── short_term_option_reversal.py    # Binary/Digital/Bliz wick reversal
+│   ├── bliz_ema_crossover.py            # Bliz 1m EMA 9/12 bias + 15s EMA 2/3 entry
 │   ├── marginal_gold_scalper.py         # Forex/Marginal XAUUSD 1m scalping
 │   ├── marginal_breakout_pro.py         # Forex/Marginal Donchian breakout
 │   └── marginal_momentum_reversal.py    # Forex/Marginal MACD + Stochastic reversal
@@ -172,9 +173,32 @@ Then set `STRATEGY=my_custom_strategy` in `.env`. The bot will detect it automat
 
 1. **`short_term_option_scalper`** — Binary/Digital/Bliz · EMA 9/21, RSI(14), Stochastic(14,3)
 2. **`short_term_option_reversal`** — Binary/Digital/Bliz · Bollinger(20,2), RSI(14), wick rejection
-3. **`marginal_gold_scalper`** — Forex/Marginal · EMA 20/50/200, MACD, ATR(14)
-4. **`marginal_breakout_pro`** — Forex/Marginal · Donchian(20), ATR volatility expansion
-5. **`marginal_momentum_reversal`** — Forex/Marginal · MACD, Stochastic, engulfing
+3. **`bliz_ema_crossover`** — Bliz · two-timeframe EMA crossover (see below)
+4. **`marginal_gold_scalper`** — Forex/Marginal · EMA 20/50/200, MACD, ATR(14)
+5. **`marginal_breakout_pro`** — Forex/Marginal · Donchian(20), ATR volatility expansion
+6. **`marginal_momentum_reversal`** — Forex/Marginal · MACD, Stochastic, engulfing
+
+### `bliz_ema_crossover` — Dual-Timeframe EMA Crossover (Bliz)
+
+Designed specifically for Bliz trading. It combines two candle timeframes:
+
+| Timeframe | Indicator | Role |
+| :--- | :--- | :--- |
+| **1 minute** (`TIMEFRAME=1`) | EMA 9 vs EMA 12 | Sets the **direction bias** — `EMA 9 > EMA 12` → bullish (BUY side), `EMA 9 < EMA 12` → bearish (SELL side) |
+| **15 seconds** (auto-fetched) | EMA 2 vs EMA 3 | Fires the **entry signal** — EMA 2 crossing **above** EMA 3 → BUY, crossing **below** → SELL |
+
+Rules:
+
+- The 15-second EMA 2/3 crossover is only acted on when it agrees with the
+  1-minute bias (bull bias + up-cross → `BUY`, bear bias + down-cross → `SELL`).
+- The engine automatically fetches the 15-second candles (`SIGNAL_TIMEFRAME = 15`)
+  and deduplicates signals per 15-second candle, so each new signal candle is
+  evaluated exactly once.
+- `EXECUTION_TIME` controls the Bliz option expiry (default `15` seconds to match
+  the signal timeframe — adjust to `30`/`60` if you prefer longer expiries).
+
+Set `MODE=BLIZ` and `STRATEGY=bliz_ema_crossover` in `.env` (this is the default
+shipping configuration).
 
 ---
 
