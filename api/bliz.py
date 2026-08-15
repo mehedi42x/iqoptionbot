@@ -14,18 +14,11 @@ from api.auth import IQOptionAuth
 
 logger = logging.getLogger("IQ_BOT.Bliz")
 
-# Bliz protocol constants
-OPTION_TYPE_ID = 12   # Bliz option type
-PROFIT_PERCENT = 92   # fixed payout percentage
-REFUND_VALUE = 0      # no refund
-
+OPTION_TYPE_ID = 12
+PROFIT_PERCENT = 92
+REFUND_VALUE = 0
 
 class BlizAPI:
-    """
-    Bliz / Blitz options trading executor for IQ Option.
-    Receives all parameters directly from core.py.
-    """
-
     def __init__(self, auth: IQOptionAuth, active_id: Optional[int] = None):
         self.auth = auth
         self.default_active_id: Optional[int] = active_id
@@ -36,24 +29,19 @@ class BlizAPI:
         self._subscribed_actives: set = set()
         self._lock = threading.Lock()
 
-        # Protocol event listeners
         self.auth.subscribe("quote-generated", self._on_quote_generated)
         self.auth.subscribe("option-closed", self._on_option_closed)
         self.auth.subscribe("blitz-option-closed", self._on_option_closed)
 
     def _resolve_active_id(self, target: Optional[Union[int, str]] = None) -> int:
-        """Resolves target into an integer active_id passed by core."""
         if isinstance(target, int):
             return target
         if isinstance(target, str) and target.isdigit():
             return int(target)
         if self.default_active_id is not None:
             return self.default_active_id
-        return 1
-
-    # ------------------------------------------------------------------ #
-    #  CANDLE FETCHING
-    # ------------------------------------------------------------------ #
+        
+        raise ValueError("CRITICAL ERROR: ACTIVE_ID is missing! You must provide an exact ACTIVE_ID in .env")
 
     def get_candles(
         self,
@@ -62,9 +50,12 @@ class BlizAPI:
         count: int = 60,
         active_id: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """Fetches candles for strategy analysis based on parameters from core.py."""
         aid = active_id or self._resolve_active_id(symbol_or_active_id)
         server_time = self.auth.get_server_time()
+        
+        if not server_time or server_time < 1000000000:
+            server_time = int(time.time())
+
         req_id = f"bliz_candles_{self.auth.generate_request_id()}"
 
         msg = {
@@ -76,61 +67,45 @@ class BlizAPI:
 
         response = self.auth.send_request("get-candles", msg, timeout=10.0, req_id=req_id)
 
-        # Fallback to v2 protocol if needed
-        if not response or not response.get("msg"):
-            v2_req_id = f"bliz_candles_v2_{self.auth.generate_request_id()}"
-            v2_msg = {
-                "name": "get-candles",
-                "version": "2.0",
-                "body": {
-                    "active_id": aid,
-                    "split": timeframe_seconds,
-                    "count": count,
-                    "to": server_time,
-                }
-            }
-            response = self.auth.send_request("sendMessage", v2_msg, timeout=10.0, req_id=v2_req_id)
+        if not response or "msg" not in response:
+            logger.error(f"Error: Failed to fetch candles for Active ID: {aid}. Stopping attempts.")
+            return []
 
-        if response and "msg" in response:
-            raw_candles = response["msg"]
-            if isinstance(raw_candles, dict):
-                if "candles" in raw_candles:
-                    raw_candles = raw_candles["candles"]
-                elif "data" in raw_candles:
-                    raw_candles = raw_candles["data"]
-                elif "msg" in raw_candles:
-                    raw_candles = raw_candles["msg"]
+        raw_candles = response["msg"]
+        if isinstance(raw_candles, dict):
+            if "candles" in raw_candles:
+                raw_candles = raw_candles["candles"]
+            elif "data" in raw_candles:
+                raw_candles = raw_candles["data"]
+            elif "msg" in raw_candles:
+                raw_candles = raw_candles["msg"]
 
-            if isinstance(raw_candles, list):
-                parsed = []
-                for c in raw_candles:
-                    if not isinstance(c, dict):
-                        continue
-                    f_time = c.get("from", c.get("at", c.get("time", 0)))
-                    o_price = float(c.get("open", 0.0))
-                    h_price = float(c.get("max", c.get("high", o_price)))
-                    l_price = float(c.get("min", c.get("low", o_price)))
-                    c_price = float(c.get("close", o_price))
-                    vol = float(c.get("volume", c.get("vol", 0.0)))
-                    parsed.append({
-                        "from": f_time,
-                        "at": f_time,
-                        "open": o_price,
-                        "high": h_price,
-                        "low": l_price,
-                        "close": c_price,
-                        "volume": vol,
-                    })
-                parsed.sort(key=lambda x: x["from"])
-                return parsed
+        if isinstance(raw_candles, list):
+            parsed = []
+            for c in raw_candles:
+                if not isinstance(c, dict):
+                    continue
+                f_time = c.get("from", c.get("at", c.get("time", 0)))
+                o_price = float(c.get("open", 0.0))
+                h_price = float(c.get("max", c.get("high", o_price)))
+                l_price = float(c.get("min", c.get("low", o_price)))
+                c_price = float(c.get("close", o_price))
+                vol = float(c.get("volume", c.get("vol", 0.0)))
+                parsed.append({
+                    "from": f_time,
+                    "at": f_time,
+                    "open": o_price,
+                    "high": h_price,
+                    "low": l_price,
+                    "close": c_price,
+                    "volume": vol,
+                })
+            parsed.sort(key=lambda x: x["from"])
+            return parsed
+        
         return []
 
-    # ------------------------------------------------------------------ #
-    #  SERVER TIME & QUOTE STREAM
-    # ------------------------------------------------------------------ #
-
     def sync_server_time(self) -> int:
-        """Requests broker server time."""
         req_id = f"time_req_{self.auth.generate_request_id()}"
         msg = {"name": "get-servertime", "version": "1.0"}
 
@@ -143,7 +118,6 @@ class BlizAPI:
         return self.auth.get_server_time()
 
     def subscribe_quotes(self, target: Optional[Union[int, str]] = None):
-        """Subscribes to live quote/tick stream for the active_id."""
         active_id = self._resolve_active_id(target)
         with self._lock:
             if active_id in self._subscribed_actives:
@@ -166,13 +140,11 @@ class BlizAPI:
         logger.debug(f"Subscribed to live quotes (active_id={active_id})")
 
     def get_latest_quote(self, target: Optional[Union[int, str]] = None) -> Optional[Dict[str, Any]]:
-        """Returns latest quote for active_id."""
         active_id = self._resolve_active_id(target)
         with self._lock:
             return self._latest_quotes.get(active_id)
 
     def _on_quote_generated(self, msg_data: Dict[str, Any]):
-        """Stores latest live quote (value, price, timestamp)."""
         msg = msg_data.get("msg", {})
         if not isinstance(msg, dict):
             return
@@ -187,10 +159,6 @@ class BlizAPI:
             }
             self._subscribed_actives.add(active_id)
 
-    # ------------------------------------------------------------------ #
-    #  TRADE EXECUTION & SETTLEMENT
-    # ------------------------------------------------------------------ #
-
     def place_order(
         self,
         symbol_or_active_id: Any,
@@ -198,7 +166,6 @@ class BlizAPI:
         amount: float,
         execution_time_seconds: int = 30,
     ) -> Dict[str, Any]:
-        """Places a Bliz option order based on command from core.py."""
         active_id = self._resolve_active_id(symbol_or_active_id)
         dir_clean = direction.strip().lower()
         opt_dir = "call" if dir_clean in ["buy", "call"] else "put"
