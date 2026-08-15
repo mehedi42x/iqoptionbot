@@ -1,6 +1,6 @@
 """
 bot.py - Main Command Line Controller
-Auto-discovers strategies and uses MODE from .env to select the trading API.
+Auto-discovers strategies, reads ACTIVE_ID and MODE from .env.
 """
 
 import os
@@ -33,8 +33,7 @@ from core import TradingEngine
 def _setup_logging() -> None:
     """
     Terminal gets ONLY clean, colour-coded lines via the console handler.
-    Full debug detail (with tracebacks) is written to case/bot.log for
-    troubleshooting, and noisy third-party loggers are silenced.
+    Full debug detail (with tracebacks) is written to case/bot.log.
     """
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
@@ -72,7 +71,6 @@ def discover_strategies() -> Dict[str, str]:
     """
     Auto-discovers strategy modules in the Strategies/ directory.
     Scans for Python files that export an `analyze` function.
-    Returns a dict mapping strategy_name -> module_path.
     """
     strategies = {}
     strategies_pkg = "Strategies"
@@ -98,13 +96,29 @@ def validate_config() -> Dict[str, Any]:
     load_dotenv(override=True)
     email = os.getenv("IQ_EMAIL", "").strip()
     password = os.getenv("IQ_PASSWORD", "").strip()
-    symbol = os.getenv("SYMBOL", "XAUUSD").strip().upper()
+    
+    active_id_str = os.getenv("ACTIVE_ID", os.getenv("BLIZ_ACTIVE_ID", "")).strip()
+    symbol = os.getenv("SYMBOL", "").strip().upper()
+
+    active_id: Optional[int] = None
+    if active_id_str:
+        try:
+            active_id = int(active_id_str)
+        except ValueError:
+            console.error(f"Invalid ACTIVE_ID '{active_id_str}' in .env. Must be a valid integer.")
+            sys.exit(1)
+        if not symbol:
+            symbol = f"ACTIVE_{active_id}"
+    else:
+        if not symbol:
+            symbol = "XAUUSD"
+
     amount = float(os.getenv("AMOUNT", "10"))
     account = os.getenv("ACCOUNT", "PRACTICE").strip().upper()
     mode = os.getenv("MODE", "").strip().upper()
-    # Fallback to TRADE_TYPE if MODE is not set (backward compatibility)
     if not mode:
         mode = os.getenv("TRADE_TYPE", "FOREX").strip().upper()
+
     exec_time = os.getenv("EXECUTION_TIME", "").strip()
     timeframe = int(os.getenv("TIMEFRAME", "1"))
     strategy = os.getenv("STRATEGY", "marginal_gold_scalper").strip()
@@ -126,7 +140,6 @@ def validate_config() -> Dict[str, Any]:
         console.error(f"Invalid MODE '{mode}'. Must be one of {VALID_MODES}")
         sys.exit(1)
 
-    # Auto-discover strategies and validate the selected one exists
     console.status("Discovering strategies...")
     available_strategies = discover_strategies()
     if not available_strategies:
@@ -139,6 +152,7 @@ def validate_config() -> Dict[str, Any]:
 
     return {
         "IQ_EMAIL": email, "IQ_PASSWORD": password, "SYMBOL": symbol,
+        "ACTIVE_ID": active_id,
         "AMOUNT": amount, "ACCOUNT": account, "MODE": mode,
         "EXECUTION_TIME": exec_time, "TIMEFRAME": timeframe, "STRATEGY": strategy,
         "LEVERAGE": leverage, "STOP_LOSS": stop_loss, "TAKE_PROFIT": take_profit,
@@ -182,18 +196,22 @@ def display_final_summary(summary: Dict[str, Any]):
 def main():
     config = validate_config()
 
-    console.banner(
-        "IQ OPTION TRADING BOT",
-        [
-            ("MODE", config.get("MODE")),
-            ("SYMBOL", config.get("SYMBOL")),
-            ("STRATEGY", config.get("STRATEGY")),
-            ("ACCOUNT", config.get("ACCOUNT")),
-            ("TIMEFRAME", f"{config.get('TIMEFRAME')} min"),
-            ("AMOUNT", f"${float(config.get('AMOUNT', 10)):.2f}"),
-            ("LEVERAGE", f"{config.get('LEVERAGE')}x"),
-        ],
-    )
+    banner_items = [
+        ("MODE", config.get("MODE")),
+        ("SYMBOL", config.get("SYMBOL")),
+    ]
+    if config.get("ACTIVE_ID"):
+        banner_items.append(("ACTIVE_ID", str(config.get("ACTIVE_ID"))))
+
+    banner_items.extend([
+        ("STRATEGY", config.get("STRATEGY")),
+        ("ACCOUNT", config.get("ACCOUNT")),
+        ("TIMEFRAME", f"{config.get('TIMEFRAME')} min"),
+        ("AMOUNT", f"${float(config.get('AMOUNT', 10)):.2f}"),
+        ("LEVERAGE", f"{config.get('LEVERAGE')}x"),
+    ])
+
+    console.banner("IQ OPTION TRADING BOT", banner_items)
 
     console.status("Loading strategy module...")
     try:
