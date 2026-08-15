@@ -11,6 +11,7 @@ IqOption/
 │
 ├── .env                              # Active environment configuration
 ├── bot.py                            # Main CLI controller, validation & display
+├── console.py                        # Clean terminal output (status line + event lines)
 ├── core.py                           # Central trading engine & orchestrator
 ├── requirements.txt                  # Python dependencies
 ├── README.md                         # Full documentation
@@ -222,6 +223,24 @@ To launch the bot:
 python3 bot.py
 ```
 
+### Terminal Output
+
+`console.py` keeps the terminal clean and readable:
+
+- **One floating status line** (with a spinner) always shows what the bot is doing
+  right now — *"Reading .env configuration…"*, *"Connecting to IQ Option…"*,
+  *"Fetching candles…"*, *"Analyzing signal…"*, *"Waiting for next candle…"*.
+  When a task finishes, the line is replaced in-place by the next task.
+- **Only essential events** are printed as permanent, colour-coded lines:
+  - `✓` success — connected, trade opened, take-profit hit, win
+  - `!` warning — stop-loss hit, loss, connection closed
+  - `✗` error — login failed, order rejected, engine-loop error
+  - `»` event — new trading signal
+- Full debug detail (with tracebacks) is written to `case/bot.log` for
+  troubleshooting, so it never clutters the terminal.
+- Colours are disabled automatically when output is redirected or when
+  `NO_COLOR=1` is set.
+
 ### Safety Note
 Always test strategies first on `ACCOUNT=PRACTICE` before running with real funds (`ACCOUNT=REAL`).
 
@@ -233,6 +252,7 @@ All runtime state and trading activity is logged persistently in the `case/` dir
 - **`case/trades.json`**: Complete trade history including trade ID, symbol, direction, entry/exit prices, SL/TP, close reason (`STOP_LOSS` / `TAKE_PROFIT`), timestamps, win/loss status, and net PnL.
 - **`case/state.json`**: Current operational state, active open position IDs, connection status, and last processed signals.
 - **`case/summary.json`**: Real-time aggregated statistics (Total Trades, Wins, Losses, Ties, Win Rate %, Starting Balance, Ending Balance, Total PnL).
+- **`case/bot.log`**: Full debug log (the clean terminal shows only the essentials).
 
 ---
 

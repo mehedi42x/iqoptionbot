@@ -26,13 +26,42 @@ except ImportError:
                     if override or k.strip() not in os.environ:
                         os.environ[k.strip()] = v.strip().strip("'\"'")
 
+from console import console, ConsoleLogHandler
 from core import TradingEngine
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+
+def _setup_logging() -> None:
+    """
+    Terminal gets ONLY clean, colour-coded lines via the console handler.
+    Full debug detail (with tracebacks) is written to case/bot.log for
+    troubleshooting, and noisy third-party loggers are silenced.
+    """
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+    root.handlers.clear()
+
+    console_handler = ConsoleLogHandler()
+    console_handler.setLevel(logging.INFO)
+    root.addHandler(console_handler)
+
+    try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        log_dir = os.path.join(base_dir, "case")
+        os.makedirs(log_dir, exist_ok=True)
+        file_handler = logging.FileHandler(os.path.join(log_dir, "bot.log"), encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s] %(message)s")
+        )
+        root.addHandler(file_handler)
+    except Exception:
+        pass
+
+    for noisy in ("websocket", "urllib3", "requests"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+_setup_logging()
 logger = logging.getLogger("IQ_BOT")
 
 VALID_MODES = ["BINARY", "DIGITAL", "FOREX", "MARGINAL", "BLIZ"]
@@ -65,6 +94,7 @@ def discover_strategies() -> Dict[str, str]:
 
 
 def validate_config() -> Dict[str, Any]:
+    console.status("Reading .env configuration...")
     load_dotenv(override=True)
     email = os.getenv("IQ_EMAIL", "").strip()
     password = os.getenv("IQ_PASSWORD", "").strip()
@@ -84,25 +114,28 @@ def validate_config() -> Dict[str, Any]:
     max_open = int(os.getenv("MAX_OPEN_TRADES", "1"))
 
     if not email:
-        sys.exit("Error: IQ_EMAIL is missing in .env")
+        console.error("IQ_EMAIL is missing in .env")
+        sys.exit(1)
     if not password:
-        sys.exit("Error: IQ_PASSWORD is missing in .env")
+        console.error("IQ_PASSWORD is missing in .env")
+        sys.exit(1)
     if account not in VALID_ACCOUNTS:
-        sys.exit(f"Error: Invalid ACCOUNT '{account}'. Must be one of {VALID_ACCOUNTS}")
+        console.error(f"Invalid ACCOUNT '{account}'. Must be one of {VALID_ACCOUNTS}")
+        sys.exit(1)
     if mode not in VALID_MODES:
-        sys.exit(f"Error: Invalid MODE '{mode}'. Must be one of {VALID_MODES}")
+        console.error(f"Invalid MODE '{mode}'. Must be one of {VALID_MODES}")
+        sys.exit(1)
 
     # Auto-discover strategies and validate the selected one exists
+    console.status("Discovering strategies...")
     available_strategies = discover_strategies()
     if not available_strategies:
-        logger.warning("No strategies discovered in Strategies/ directory!")
+        console.warning("No strategies discovered in Strategies/ directory.")
     elif strategy not in available_strategies:
-        logger.warning(
-            f"Strategy '{strategy}' not found in discovered strategies: {list(available_strategies.keys())}"
+        console.warning(
+            f"Strategy '{strategy}' not found in {list(available_strategies.keys())}. "
+            "The engine will try to load it anyway."
         )
-        # Don't exit — allow runtime fallback; core will handle import error
-
-    logger.info(f"Configuration loaded — MODE={mode} STRATEGY={strategy} SYMBOL={symbol} ACCOUNT={account}")
 
     return {
         "IQ_EMAIL": email, "IQ_PASSWORD": password, "SYMBOL": symbol,
@@ -114,28 +147,64 @@ def validate_config() -> Dict[str, Any]:
 
 
 def display_final_summary(summary: Dict[str, Any]):
-    print("\n" + "=" * 65)
-    print("                    FINAL TRADING SUMMARY")
-    print("=" * 65)
-    print(f" Total Trades Executed:   {summary.get('total_trades', 0)}")
-    print(f" Winning Trades:          {summary.get('winning_trades', 0)} (Green)")
-    print(f" Losing Trades:           {summary.get('losing_trades', 0)} (Red)")
-    print(f" Tie / Equal Trades:      {summary.get('tie_trades', 0)}")
-    print(f" Overall Win Rate:        {summary.get('win_rate', 0.0):.2f}%")
-    print("-" * 65)
-    print(f" Starting Balance:        ${summary.get('starting_balance', 0.0):.2f}")
-    print(f" Ending Balance:          ${summary.get('ending_balance', 0.0):.2f}")
+    console.stop()
+    total = summary.get("total_trades", 0)
+    wins = summary.get("winning_trades", 0)
+    losses = summary.get("losing_trades", 0)
+    ties = summary.get("tie_trades", 0)
+    win_rate = summary.get("win_rate", 0.0)
+    start = summary.get("starting_balance", 0.0)
+    end = summary.get("ending_balance", 0.0)
     pnl = summary.get("total_pnl", 0.0)
-    print(f" Net Session PnL:         {'+' if pnl >= 0 else ''}${pnl:.2f}")
-    print("=" * 65 + "\n")
+
+    console.banner(
+        "FINAL TRADING SUMMARY",
+        [
+            ("Total trades", f"{total}"),
+            ("Winning", f"{wins}  (green)"),
+            ("Losing", f"{losses}  (red)"),
+            ("Tie / equal", f"{ties}"),
+            ("Win rate", f"{win_rate:.2f}%"),
+            ("-", ""),
+            ("Start balance", f"${start:.2f}"),
+            ("End balance", f"${end:.2f}"),
+            ("Net PnL", f"{'+' if pnl >= 0 else ''}${pnl:.2f}"),
+        ],
+    )
+    if pnl > 0:
+        console.success(f"Session finished in profit: +${pnl:.2f}")
+    elif pnl < 0:
+        console.warning(f"Session finished in loss: ${pnl:.2f}")
+    else:
+        console.info("Session finished break-even.")
 
 
 def main():
     config = validate_config()
-    engine = TradingEngine(config)
+
+    console.banner(
+        "IQ OPTION TRADING BOT",
+        [
+            ("MODE", config.get("MODE")),
+            ("SYMBOL", config.get("SYMBOL")),
+            ("STRATEGY", config.get("STRATEGY")),
+            ("ACCOUNT", config.get("ACCOUNT")),
+            ("TIMEFRAME", f"{config.get('TIMEFRAME')} min"),
+            ("AMOUNT", f"${float(config.get('AMOUNT', 10)):.2f}"),
+            ("LEVERAGE", f"{config.get('LEVERAGE')}x"),
+        ],
+    )
+
+    console.status("Loading strategy module...")
+    try:
+        engine = TradingEngine(config)
+    except Exception as e:
+        console.error(f"Failed to initialize the trading engine: {e}")
+        sys.exit(1)
 
     def signal_handler(sig, frame):
-        print("\n[INFO] Stopping bot gracefully...")
+        console.stop()
+        console.warning("Stopping bot gracefully...")
         engine.stop()
         display_final_summary(engine.get_summary())
         sys.exit(0)
