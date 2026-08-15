@@ -29,16 +29,25 @@ CONTINUOUS_MODES = {"FOREX", "MARGINAL"}
 FIXED_EXPIRY_MODES = {"BINARY", "DIGITAL", "BLIZ"}
 MARGINAL_MODES = {"FOREX", "MARGINAL"}
 
-
 class TradingEngine:
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.running = False
         self._stop_requested = threading.Event()
 
-        self.symbol: str = str(self.config.get("SYMBOL", "XAUUSD"))
+        self.symbol: str = str(self.config.get("SYMBOL", "")).strip()
         self.active_id: Optional[int] = self.config.get("ACTIVE_ID")
-        self._mode: str = str(self.config.get("MODE", "FOREX")).upper()
+        self._mode: str = str(self.config.get("MODE", "")).strip().upper()
+
+        if not self._mode:
+            raise ValueError("CRITICAL ERROR: MODE is missing in .env!")
+        if self._mode == "BLIZ" and not self.active_id:
+            raise ValueError(f"CRITICAL ERROR: ACTIVE_ID is missing in .env! Cannot trade in {self._mode} mode without it.")
+        if not self.symbol:
+            raise ValueError("CRITICAL ERROR: SYMBOL is missing in .env!")
+
+        if self.active_id is not None:
+            self.active_id = int(self.active_id)
 
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
         self.case_dir = os.path.join(self.base_dir, "case")
@@ -62,9 +71,7 @@ class TradingEngine:
         self.api = self._initialize_trade_api()
 
     def _initialize_trade_api(self):
-        """Selects and initializes the trading API with configuration from core."""
         logger.debug(f"Initializing trading API for MODE={self._mode}")
-
         if self._mode == "BINARY":
             return BinaryAPI(self.auth)
         elif self._mode == "DIGITAL":
@@ -72,7 +79,6 @@ class TradingEngine:
         elif self._mode in ["FOREX", "MARGINAL"]:
             return MarginalAPI(self.auth)
         elif self._mode == "BLIZ":
-            # Passes active_id explicitly to BlizAPI
             return BlizAPI(self.auth, active_id=self.active_id)
         raise ValueError(f"Unknown MODE: {self._mode}")
 
@@ -116,13 +122,11 @@ class TradingEngine:
 
                 self.current_balance = self.auth.get_balance()
 
-                # --- SL/TP monitoring for continuous/marginal modes ---
                 if self._mode in MARGINAL_MODES:
                     console.status("Monitoring open trades (SL/TP)...")
                     self._monitor_active_trades_market_price()
                     self._monitor_active_trades()
 
-                # --- Check max open trades ---
                 max_open = int(self.config.get("MAX_OPEN_TRADES", 1))
                 with self._trade_lock:
                     if len(self.active_trades) >= max_open:
@@ -132,7 +136,6 @@ class TradingEngine:
                         time.sleep(2)
                         continue
 
-                # --- Fetch candles ---
                 console.status("Fetching candles...")
                 candles = self.api.get_candles(
                     symbol_or_active_id=(self.active_id if self._mode == "BLIZ" else symbol),
@@ -144,7 +147,6 @@ class TradingEngine:
                     time.sleep(2)
                     continue
 
-                # Optional secondary (signal) timeframe for multi-timeframe strategies
                 signal_timeframe = getattr(self.strategy_module, "SIGNAL_TIMEFRAME", None)
                 signal_candles = None
                 if signal_timeframe:
@@ -166,7 +168,6 @@ class TradingEngine:
                     time.sleep(1)
                     continue
 
-                # --- Analyze Signal ---
                 console.status("Analyzing signal...")
                 signal = self.strategy_module.analyze({
                     "candles": candles,
@@ -191,10 +192,6 @@ class TradingEngine:
                 console.error(f"Engine loop error: {e}")
                 logger.debug("Engine loop traceback:", exc_info=True)
             time.sleep(1)
-
-    # ------------------------------------------------------------------ #
-    #  SIGNAL EXECUTION
-    # ------------------------------------------------------------------ #
 
     def _execute_signal(self, signal: str, current_price: float):
         symbol = self.symbol
@@ -247,7 +244,6 @@ class TradingEngine:
                 console.error(f"Order rejected: {res.get('error', 'unknown error')}")
 
         else:
-            # Fixed-expiry modes (BLIZ, BINARY, DIGITAL)
             exec_time = int(self.config.get("EXECUTION_TIME", 30) or 30)
             target = self.active_id if self._mode == "BLIZ" else symbol
             res = self.api.place_order(target, signal, amount, exec_time)
@@ -286,10 +282,6 @@ class TradingEngine:
                 ).start()
             else:
                 console.error(f"Order rejected: {res.get('error', 'unknown error')}")
-
-    # ------------------------------------------------------------------ #
-    #  SL/TP MARKET-PRICE TRACKING
-    # ------------------------------------------------------------------ #
 
     def _get_current_price(self, symbol: str) -> Optional[float]:
         try:
@@ -379,10 +371,6 @@ class TradingEngine:
         else:
             console.error(f"Failed to close trade #{pos_id} via API.")
 
-    # ------------------------------------------------------------------ #
-    #  OPTION SETTLEMENT
-    # ------------------------------------------------------------------ #
-
     def _wait_and_settle_option(self, trade_record: Dict[str, Any]):
         trade_id = int(trade_record["trade_id"])
         result = self.api.wait_for_result(trade_id)
@@ -434,10 +422,6 @@ class TradingEngine:
                 self._record_closed_trade(trade)
                 self._update_state()
                 self._update_summary()
-
-    # ------------------------------------------------------------------ #
-    #  PERSISTENCE HELPERS
-    # ------------------------------------------------------------------ #
 
     def _record_closed_trade(self, trade_record: Dict[str, Any]):
         try:
