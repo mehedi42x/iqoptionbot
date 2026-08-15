@@ -11,6 +11,7 @@ IqOption/
 │
 ├── .env                              # Active environment configuration
 ├── bot.py                            # Main CLI controller, validation & display
+├── console.py                        # Clean terminal output (status line + event lines)
 ├── core.py                           # Central trading engine & orchestrator
 ├── requirements.txt                  # Python dependencies
 ├── README.md                         # Full documentation
@@ -19,6 +20,7 @@ IqOption/
 │   ├── __init__.py
 │   ├── short_term_option_scalper.py     # Binary/Digital/Bliz scalping
 │   ├── short_term_option_reversal.py    # Binary/Digital/Bliz wick reversal
+│   ├── bliz_ema_crossover.py            # Bliz 1m EMA 9/12 bias + 15s EMA 2/3 entry
 │   ├── marginal_gold_scalper.py         # Forex/Marginal XAUUSD 1m scalping
 │   ├── marginal_breakout_pro.py         # Forex/Marginal Donchian breakout
 │   └── marginal_momentum_reversal.py    # Forex/Marginal MACD + Stochastic reversal
@@ -171,9 +173,32 @@ Then set `STRATEGY=my_custom_strategy` in `.env`. The bot will detect it automat
 
 1. **`short_term_option_scalper`** — Binary/Digital/Bliz · EMA 9/21, RSI(14), Stochastic(14,3)
 2. **`short_term_option_reversal`** — Binary/Digital/Bliz · Bollinger(20,2), RSI(14), wick rejection
-3. **`marginal_gold_scalper`** — Forex/Marginal · EMA 20/50/200, MACD, ATR(14)
-4. **`marginal_breakout_pro`** — Forex/Marginal · Donchian(20), ATR volatility expansion
-5. **`marginal_momentum_reversal`** — Forex/Marginal · MACD, Stochastic, engulfing
+3. **`bliz_ema_crossover`** — Bliz · two-timeframe EMA crossover (see below)
+4. **`marginal_gold_scalper`** — Forex/Marginal · EMA 20/50/200, MACD, ATR(14)
+5. **`marginal_breakout_pro`** — Forex/Marginal · Donchian(20), ATR volatility expansion
+6. **`marginal_momentum_reversal`** — Forex/Marginal · MACD, Stochastic, engulfing
+
+### `bliz_ema_crossover` — Dual-Timeframe EMA Crossover (Bliz)
+
+Designed specifically for Bliz trading. It combines two candle timeframes:
+
+| Timeframe | Indicator | Role |
+| :--- | :--- | :--- |
+| **1 minute** (`TIMEFRAME=1`) | EMA 9 vs EMA 12 | Sets the **direction bias** — `EMA 9 > EMA 12` → bullish (BUY side), `EMA 9 < EMA 12` → bearish (SELL side) |
+| **15 seconds** (auto-fetched) | EMA 2 vs EMA 3 | Fires the **entry signal** — EMA 2 crossing **above** EMA 3 → BUY, crossing **below** → SELL |
+
+Rules:
+
+- The 15-second EMA 2/3 crossover is only acted on when it agrees with the
+  1-minute bias (bull bias + up-cross → `BUY`, bear bias + down-cross → `SELL`).
+- The engine automatically fetches the 15-second candles (`SIGNAL_TIMEFRAME = 15`)
+  and deduplicates signals per 15-second candle, so each new signal candle is
+  evaluated exactly once.
+- `EXECUTION_TIME` controls the Bliz option expiry (default `15` seconds to match
+  the signal timeframe — adjust to `30`/`60` if you prefer longer expiries).
+
+Set `MODE=BLIZ` and `STRATEGY=bliz_ema_crossover` in `.env` (this is the default
+shipping configuration).
 
 ---
 
@@ -222,6 +247,24 @@ To launch the bot:
 python3 bot.py
 ```
 
+### Terminal Output
+
+`console.py` keeps the terminal clean and readable:
+
+- **One floating status line** (with a spinner) always shows what the bot is doing
+  right now — *"Reading .env configuration…"*, *"Connecting to IQ Option…"*,
+  *"Fetching candles…"*, *"Analyzing signal…"*, *"Waiting for next candle…"*.
+  When a task finishes, the line is replaced in-place by the next task.
+- **Only essential events** are printed as permanent, colour-coded lines:
+  - `✓` success — connected, trade opened, take-profit hit, win
+  - `!` warning — stop-loss hit, loss, connection closed
+  - `✗` error — login failed, order rejected, engine-loop error
+  - `»` event — new trading signal
+- Full debug detail (with tracebacks) is written to `case/bot.log` for
+  troubleshooting, so it never clutters the terminal.
+- Colours are disabled automatically when output is redirected or when
+  `NO_COLOR=1` is set.
+
 ### Safety Note
 Always test strategies first on `ACCOUNT=PRACTICE` before running with real funds (`ACCOUNT=REAL`).
 
@@ -233,6 +276,7 @@ All runtime state and trading activity is logged persistently in the `case/` dir
 - **`case/trades.json`**: Complete trade history including trade ID, symbol, direction, entry/exit prices, SL/TP, close reason (`STOP_LOSS` / `TAKE_PROFIT`), timestamps, win/loss status, and net PnL.
 - **`case/state.json`**: Current operational state, active open position IDs, connection status, and last processed signals.
 - **`case/summary.json`**: Real-time aggregated statistics (Total Trades, Wins, Losses, Ties, Win Rate %, Starting Balance, Ending Balance, Total PnL).
+- **`case/bot.log`**: Full debug log (the clean terminal shows only the essentials).
 
 ---
 

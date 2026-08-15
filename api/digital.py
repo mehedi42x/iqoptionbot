@@ -133,7 +133,7 @@ class DigitalAPI:
             "underlying": clean_symbol,
         }
 
-        logger.info(
+        logger.debug(
             f"Placing Digital Option Order: {clean_symbol} | Dir: {call_put.upper()} | Amount: ${amount} | Exp: {execution_time_seconds}s"
         )
 
@@ -245,7 +245,7 @@ class DigitalAPI:
             if order_id in self._result_events:
                 self._result_events[order_id].set()
 
-        logger.info(f"Digital Option #{order_id} Closed -> Result: {res_str} | PnL: ${pnl:+.2f}")
+        logger.debug(f"Digital Option #{order_id} Closed -> Result: {res_str} | PnL: ${pnl:+.2f}")
 
     def _on_position_changed(self, msg_data: Dict[str, Any]):
         """Handles position update status for digital options."""

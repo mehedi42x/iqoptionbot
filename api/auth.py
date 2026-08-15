@@ -13,6 +13,8 @@ from typing import Any, Callable, Dict, List, Optional
 import requests
 import websocket
 
+from console import console
+
 logger = logging.getLogger("IQ_BOT.Auth")
 
 
@@ -53,7 +55,7 @@ class IQOptionAuth:
         return "".join(random.choice(chars) for _ in range(16))
 
     def login(self) -> bool:
-        logger.info(f"Logging in with account: {self.email}")
+        console.status("Logging in to IQ Option...")
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Content-Type": "application/json",
@@ -69,19 +71,19 @@ class IQOptionAuth:
                     ssid = self.session.cookies.get_dict().get("ssid")
                 if ssid:
                     self.ssid = ssid
-                    logger.info("HTTP Login successful. Session SSID retrieved.")
+                    logger.debug("HTTP login successful. Session SSID retrieved.")
                     return True
-            logger.error(f"Login failed: {data.get('message', 'Auth error')}")
+            console.error(f"Login failed: {data.get('message', 'Auth error')}")
             return False
         except Exception as e:
-            logger.error(f"Exception during HTTP login: {e}")
+            console.error(f"Login exception: {e}")
             return False
 
     def connect_ws(self) -> bool:
         if not self.ssid and not self.login():
             return False
 
-        logger.info("Opening WebSocket connection...")
+        console.status("Connecting to IQ Option (WebSocket)...")
         self._stop_event.clear()
         self.ws = websocket.WebSocketApp(
             self.WS_URL,
@@ -102,18 +104,19 @@ class IQOptionAuth:
         while time.time() - start_time < timeout:
             if self.is_authenticated and self.active_balance_id is not None:
                 self.set_account_type(self.target_account_type)
-                logger.info(
-                    f"WebSocket Connected & Authenticated. Selected Account: {self.target_account_type} | Balance: {self.current_balance:.2f} {self.currency}"
+                console.success(
+                    f"Connected & authenticated · Account {self.target_account_type} · "
+                    f"Balance ${self.current_balance:.2f} {self.currency}"
                 )
                 self._start_heartbeat()
                 return True
             time.sleep(0.3)
 
-        logger.error("WebSocket connection timed out waiting for authentication.")
+        console.error("WebSocket connection timed out during authentication.")
         return False
 
     def _on_ws_open(self, ws):
-        logger.info("WebSocket connected. Authenticating SSID...")
+        console.status("Authenticating session...")
         self.is_connected = True
         auth_msg = {"name": "ssid", "msg": self.ssid, "request_id": "auth_" + self.generate_request_id()}
         self.send_raw(auth_msg)

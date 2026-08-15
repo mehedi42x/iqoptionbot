@@ -82,7 +82,7 @@ class BlizAPI:
                 overridden = int(override)
                 symbol = os.getenv("SYMBOL", "XAUUSD").strip().upper().replace("/", "").replace(" ", "")
                 self.actives_map[symbol] = overridden
-                logger.info(f"Bliz active_id override: {symbol} -> {overridden}")
+                logger.debug(f"Bliz active_id override: {symbol} -> {overridden}")
             except (ValueError, TypeError):
                 logger.warning(f"Invalid BLIZ_ACTIVE_ID in .env: {override!r}")
 
@@ -179,7 +179,7 @@ class BlizAPI:
             "request_id": f"sub_{self.auth.generate_request_id()}",
         }
         self.auth.send_raw(payload)
-        logger.info(f"Subscribed to live quotes for {symbol} (active_id={active_id})")
+        logger.debug(f"Subscribed to live quotes for {symbol} (active_id={active_id})")
 
     def get_latest_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Returns the latest saved quote for the asset, if any."""
@@ -260,7 +260,7 @@ class BlizAPI:
         req_id = f"trade_{self.auth.generate_request_id()}"
         msg = {"name": "binary-options.open-option", "version": "2.0", "body": body}
 
-        logger.info(
+        logger.debug(
             f"Placing Bliz Order: {symbol} | Dir: {opt_dir.upper()} | Amount: ${amount} | "
             f"Exp: {expiration_size}s | Value: {value}"
         )
@@ -388,4 +388,4 @@ class BlizAPI:
             if order_id in self._result_events:
                 self._result_events[order_id].set()
 
-        logger.info(f"Bliz Order #{order_id} Settled -> Result: {res_str} | PnL: ${pnl:+.2f}")
+        logger.debug(f"Bliz Order #{order_id} Settled -> Result: {res_str} | PnL: ${pnl:+.2f}")

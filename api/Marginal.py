@@ -88,7 +88,7 @@ class MarginalAPI:
         # NOTE: stop_loss and take_profit are intentionally NOT sent.
         # The core engine will track the market and close the trade when SL/TP is hit.
 
-        logger.info(
+        logger.debug(
             f"Placing Marginal Order: {symbol} | Side: {side.upper()} | Amount: ${amount} | Leverage: {leverage}x"
         )
 
@@ -120,14 +120,14 @@ class MarginalAPI:
         Closes an open marginal/forex position by market.
         Used by the core engine when SL or TP is hit.
         """
-        logger.info(f"Closing Marginal Position #{position_id}...")
+        logger.debug(f"Closing Marginal Position #{position_id}...")
         msg = {
             "position_id": position_id,
             "user_balance_id": self.auth.active_balance_id,
         }
         res = self.auth.send_request("marginal-forex.close-by-market", msg, timeout=10.0)
         if res and res.get("is_ok", res.get("msg")) is not None:
-            logger.info(f"Position #{position_id} close request sent successfully.")
+            logger.debug(f"Position #{position_id} close request sent successfully.")
             return {"success": True, "position_id": position_id}
         logger.warning(f"Failed to close position #{position_id}: {res}")
         return {"success": False, "position_id": position_id, "error": str(res)}
