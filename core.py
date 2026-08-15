@@ -1,9 +1,10 @@
 """
 core.py - Central Engine and Orchestrator
-- Uses MODE from .env to select the trading API (bliz / binary / digital / marginal)
-- Handles Stop Loss and Take Profit by tracking the market price directly
-  (broker does NOT auto-close — the bot closes the trade when SL or TP is hit)
-- Auto-discovers strategies via import
+- Main intelligence of the trading bot.
+- Holds full configuration and passes instructions to respective API modules.
+- Uses MODE from config to select and initialize the trading API.
+- Handles Stop Loss and Take Profit via direct market-price tracking.
+- Orchestrates multi-timeframe candle fetching, signal generation, and trade settlements.
 """
 
 import importlib
@@ -24,11 +25,8 @@ from api.Marginal import MarginalAPI
 
 logger = logging.getLogger("IQ_BOT.Core")
 
-# Which modes are "continuous" (forex/marginal) vs "fixed-expiry" (binary/digital/bliz)
 CONTINUOUS_MODES = {"FOREX", "MARGINAL"}
 FIXED_EXPIRY_MODES = {"BINARY", "DIGITAL", "BLIZ"}
-
-# Modes that use marginal (position-based) API
 MARGINAL_MODES = {"FOREX", "MARGINAL"}
 
 
@@ -37,6 +35,10 @@ class TradingEngine:
         self.config = config
         self.running = False
         self._stop_requested = threading.Event()
+
+        self.symbol: str = str(self.config.get("SYMBOL", "XAUUSD"))
+        self.active_id: Optional[int] = self.config.get("ACTIVE_ID")
+        self._mode: str = str(self.config.get("MODE", "FOREX")).upper()
 
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
         self.case_dir = os.path.join(self.base_dir, "case")
@@ -51,29 +53,28 @@ class TradingEngine:
         self.last_candle_timestamp: Optional[int] = None
         self._trade_lock = threading.Lock()
 
-        self.strategy_module = importlib.import_module(f"Strategies.{config.get('STRATEGY')}")
+        self.strategy_module = importlib.import_module(f"Strategies.{self.config.get('STRATEGY')}")
         self.auth = IQOptionAuth(
-            email=config.get("IQ_EMAIL", ""),
-            password=config.get("IQ_PASSWORD", ""),
-            account_type=config.get("ACCOUNT", "PRACTICE"),
+            email=self.config.get("IQ_EMAIL", ""),
+            password=self.config.get("IQ_PASSWORD", ""),
+            account_type=self.config.get("ACCOUNT", "PRACTICE"),
         )
         self.api = self._initialize_trade_api()
-        self._mode = self.config.get("MODE", "FOREX").upper()
 
     def _initialize_trade_api(self):
-        """Selects the trading API based on MODE from .env."""
-        mode = self.config.get("MODE", "FOREX").upper()
-        logger.debug(f"Initializing trading API for MODE={mode}")
+        """Selects and initializes the trading API with configuration from core."""
+        logger.debug(f"Initializing trading API for MODE={self._mode}")
 
-        if mode == "BINARY":
+        if self._mode == "BINARY":
             return BinaryAPI(self.auth)
-        elif mode == "DIGITAL":
+        elif self._mode == "DIGITAL":
             return DigitalAPI(self.auth)
-        elif mode in ["FOREX", "MARGINAL"]:
+        elif self._mode in ["FOREX", "MARGINAL"]:
             return MarginalAPI(self.auth)
-        elif mode == "BLIZ":
-            return BlizAPI(self.auth)
-        raise ValueError(f"Unknown MODE: {mode}")
+        elif self._mode == "BLIZ":
+            # Passes active_id explicitly to BlizAPI
+            return BlizAPI(self.auth, active_id=self.active_id)
+        raise ValueError(f"Unknown MODE: {self._mode}")
 
     def initialize(self) -> bool:
         if not self.auth.connect_ws():
@@ -88,8 +89,9 @@ class TradingEngine:
     def _waiting_status(self, symbol: str, timeframe_min: int) -> str:
         with self._trade_lock:
             open_count = len(self.active_trades)
+        display_target = f"{symbol}" + (f" (ID:{self.active_id})" if self.active_id else "")
         return (
-            f"Waiting for next candle · {symbol} · {timeframe_min}m · "
+            f"Waiting for next candle · {display_target} · {timeframe_min}m · "
             f"Balance ${self.current_balance:.2f} · Open trades {open_count}"
         )
 
@@ -97,9 +99,10 @@ class TradingEngine:
         self.running = True
         timeframe_sec = int(self.config.get("TIMEFRAME", 1)) * 60
         timeframe_min = int(self.config.get("TIMEFRAME", 1))
-        symbol = self.config.get("SYMBOL", "XAUUSD")
+        symbol = self.symbol
 
-        console.success(f"Engine started · {self._mode} · {symbol}")
+        display_name = f"{symbol}" + (f" (ID:{self.active_id})" if self.active_id else "")
+        console.success(f"Engine started · {self._mode} · {display_name}")
         console.status(self._waiting_status(symbol, timeframe_min))
 
         while not self._stop_requested.is_set():
@@ -113,11 +116,11 @@ class TradingEngine:
 
                 self.current_balance = self.auth.get_balance()
 
-                # --- SL/TP monitoring: check every cycle for continuous modes ---
+                # --- SL/TP monitoring for continuous/marginal modes ---
                 if self._mode in MARGINAL_MODES:
                     console.status("Monitoring open trades (SL/TP)...")
                     self._monitor_active_trades_market_price()
-                    self._monitor_active_trades()  # fallback: pick up broker-closed positions
+                    self._monitor_active_trades()
 
                 # --- Check max open trades ---
                 max_open = int(self.config.get("MAX_OPEN_TRADES", 1))
@@ -129,21 +132,26 @@ class TradingEngine:
                         time.sleep(2)
                         continue
 
-                # --- Fetch candles & generate signal ---
+                # --- Fetch candles ---
                 console.status("Fetching candles...")
-                candles = self.api.get_candles(symbol, timeframe_seconds=timeframe_sec, count=120)
+                candles = self.api.get_candles(
+                    symbol_or_active_id=(self.active_id if self._mode == "BLIZ" else symbol),
+                    timeframe_seconds=timeframe_sec,
+                    count=120
+                )
                 if not candles or len(candles) < 30:
                     console.status("Loading candle history...")
                     time.sleep(2)
                     continue
 
-                # Optional secondary (signal) timeframe for multi-timeframe
-                # strategies such as the Bliz EMA crossover scalper.
+                # Optional secondary (signal) timeframe for multi-timeframe strategies
                 signal_timeframe = getattr(self.strategy_module, "SIGNAL_TIMEFRAME", None)
                 signal_candles = None
                 if signal_timeframe:
                     signal_candles = self.api.get_candles(
-                        symbol, timeframe_seconds=int(signal_timeframe), count=120
+                        symbol_or_active_id=(self.active_id if self._mode == "BLIZ" else symbol),
+                        timeframe_seconds=int(signal_timeframe),
+                        count=120
                     )
                     if not signal_candles or len(signal_candles) < 5:
                         console.status(f"Loading {int(signal_timeframe)}s candle history...")
@@ -158,6 +166,7 @@ class TradingEngine:
                     time.sleep(1)
                     continue
 
+                # --- Analyze Signal ---
                 console.status("Analyzing signal...")
                 signal = self.strategy_module.analyze({
                     "candles": candles,
@@ -166,12 +175,13 @@ class TradingEngine:
                         signal_candles[-1]["close"] if signal_candles else candles[-1]["close"]
                     ),
                     "symbol": symbol,
+                    "active_id": self.active_id,
                 })
                 self.last_candle_timestamp = latest_time
                 self._update_state(last_signal=signal)
 
                 if signal in ["BUY", "SELL"]:
-                    console.event(f"Signal {signal} · {symbol} @ {candles[-1]['close']}")
+                    console.event(f"Signal {signal} · {display_name} @ {candles[-1]['close']}")
                     console.status("Placing order...")
                     self._execute_signal(signal, candles[-1]["close"])
 
@@ -187,11 +197,7 @@ class TradingEngine:
     # ------------------------------------------------------------------ #
 
     def _execute_signal(self, signal: str, current_price: float):
-        """
-        Executes a trading signal.
-        For marginal/forex modes, SL/TP are stored locally (NOT sent to broker).
-        """
-        symbol = self.config.get("SYMBOL", "XAUUSD")
+        symbol = self.symbol
         amount = float(self.config.get("AMOUNT", 10.0))
 
         if self._mode in MARGINAL_MODES:
@@ -199,25 +205,21 @@ class TradingEngine:
             sl_dist = float(self.config.get("STOP_LOSS", 2.0))
             tp_dist = float(self.config.get("TAKE_PROFIT", 4.0))
 
-            # Calculate SL/TP prices (stored locally, NOT sent to broker)
             sl_price = round(current_price - sl_dist, 4) if signal == "BUY" else round(current_price + sl_dist, 4)
             tp_price = round(current_price + tp_dist, 4) if signal == "BUY" else round(current_price - tp_dist, 4)
 
-            logger.debug(
-                f"Executing {signal} — Entry: {current_price}, "
-                f"SL: {sl_price}, TP: {tp_price} (bot-managed)"
-            )
+            logger.debug(f"Executing {signal} — Entry: {current_price}, SL: {sl_price}, TP: {tp_price}")
 
-            # place_order no longer sends SL/TP to the broker
             res = self.api.place_order(
                 symbol, signal, amount, lev,
-                stop_loss_price=sl_price,   # for local record only
-                take_profit_price=tp_price,  # for local record only
+                stop_loss_price=sl_price,
+                take_profit_price=tp_price,
             )
             if res.get("success"):
                 trade_record = {
                     "trade_id": str(res.get("position_id")),
                     "symbol": symbol,
+                    "active_id": self.active_id,
                     "trade_type": self._mode,
                     "strategy": self.config.get("STRATEGY"),
                     "direction": signal,
@@ -245,14 +247,16 @@ class TradingEngine:
                 console.error(f"Order rejected: {res.get('error', 'unknown error')}")
 
         else:
-            # Fixed-expiry modes (binary, digital, bliz) — no SL/TP
-            # EXECUTION_TIME is in SECONDS (e.g. 60 = 1 minute)
-            exec_time = int(self.config.get("EXECUTION_TIME", 60) or 60)
-            res = self.api.place_order(symbol, signal, amount, exec_time)
+            # Fixed-expiry modes (BLIZ, BINARY, DIGITAL)
+            exec_time = int(self.config.get("EXECUTION_TIME", 30) or 30)
+            target = self.active_id if self._mode == "BLIZ" else symbol
+            res = self.api.place_order(target, signal, amount, exec_time)
+
             if res.get("success"):
                 trade_record = {
                     "trade_id": str(res.get("order_id")),
                     "symbol": symbol,
+                    "active_id": self.active_id,
                     "trade_type": self._mode,
                     "strategy": self.config.get("STRATEGY"),
                     "direction": signal,
@@ -284,14 +288,10 @@ class TradingEngine:
                 console.error(f"Order rejected: {res.get('error', 'unknown error')}")
 
     # ------------------------------------------------------------------ #
-    #  SL/TP MARKET-PRICE TRACKING  (the core of the change)
+    #  SL/TP MARKET-PRICE TRACKING
     # ------------------------------------------------------------------ #
 
     def _get_current_price(self, symbol: str) -> Optional[float]:
-        """
-        Fetches the latest market price for the given symbol.
-        Uses the current candle close as the real-time price estimate.
-        """
         try:
             tf = int(self.config.get("TIMEFRAME", 1)) * 60
             candles = self.api.get_candles(symbol, timeframe_seconds=tf, count=5)
@@ -302,11 +302,6 @@ class TradingEngine:
         return None
 
     def _monitor_active_trades_market_price(self):
-        """
-        Monitors all active marginal/forex trades and closes them when
-        Stop Loss or Take Profit is hit.  The broker does NOT auto-close —
-        the bot does it itself by tracking the market price.
-        """
         with self._trade_lock:
             active_copy = list(self.active_trades)
 
@@ -315,26 +310,21 @@ class TradingEngine:
             direction = trade["direction"]
             sl = trade.get("stop_loss")
             tp = trade.get("take_profit")
-            trade_id = trade.get("trade_id")
 
             if sl is None and tp is None:
-                continue  # no SL/TP set for this trade
+                continue
 
             current_price = self._get_current_price(symbol)
             if current_price is None:
                 continue
 
             hit_reason = None
-
             if direction == "BUY":
-                # Long position: SL is below entry, TP is above entry
                 if sl is not None and current_price <= sl:
                     hit_reason = "STOP_LOSS"
                 elif tp is not None and current_price >= tp:
                     hit_reason = "TAKE_PROFIT"
-
             elif direction == "SELL":
-                # Short position: SL is above entry, TP is below entry
                 if sl is not None and current_price >= sl:
                     hit_reason = "STOP_LOSS"
                 elif tp is not None and current_price <= tp:
@@ -344,18 +334,11 @@ class TradingEngine:
                 self._close_trade_by_core(trade, hit_reason, current_price)
 
     def _close_trade_by_core(self, trade: Dict[str, Any], reason: str, exit_price: float):
-        """
-        Closes a trade because SL or TP was hit.
-        The bot calls the API to close the position (broker does NOT auto-close).
-        """
         pos_id = int(trade["trade_id"])
         logger.debug(f"Closing trade #{pos_id} — Reason: {reason} @ {exit_price}")
 
-        # Call the API to close the position
         result = self.api.close_position(pos_id)
-
         if result.get("success"):
-            # Calculate PnL (rough estimate based on entry/exit)
             entry = trade["entry_price"]
             direction = trade["direction"]
             amount = trade["amount"]
@@ -369,7 +352,6 @@ class TradingEngine:
             pnl = round(pnl_pct * amount * leverage, 2)
             res_str = "WIN" if pnl > 0 else ("TIE" if pnl == 0 else "LOSS")
 
-            # Update trade record
             trade["status"] = "CLOSED"
             trade["result"] = res_str
             trade["pnl"] = pnl
@@ -395,14 +377,10 @@ class TradingEngine:
             else:
                 console.info(msg)
         else:
-            console.error(
-                f"Failed to close trade #{pos_id} via API. "
-                "The position may already be closed by the broker — will re-check."
-            )
-            # Fall through: the position-changed subscription will pick it up eventually
+            console.error(f"Failed to close trade #{pos_id} via API.")
 
     # ------------------------------------------------------------------ #
-    #  OPTION SETTLEMENT  (for fixed-expiry modes: binary, digital, bliz)
+    #  OPTION SETTLEMENT
     # ------------------------------------------------------------------ #
 
     def _wait_and_settle_option(self, trade_record: Dict[str, Any]):
@@ -433,16 +411,7 @@ class TradingEngine:
         else:
             console.error(f"Option #{trade_id} settled · {symbol} · {res}")
 
-    # ------------------------------------------------------------------ #
-    #  LEGACY BROKER-CLOSED MONITORING  (fallback for broker-closed positions)
-    # ------------------------------------------------------------------ #
-
     def _monitor_active_trades(self):
-        """
-        Legacy monitor that checks if the broker has closed any positions.
-        Only used as a fallback for marginal modes.
-        The primary closing mechanism is now _monitor_active_trades_market_price().
-        """
         if self._mode not in MARGINAL_MODES:
             return
         with self._trade_lock:
@@ -465,16 +434,6 @@ class TradingEngine:
                 self._record_closed_trade(trade)
                 self._update_state()
                 self._update_summary()
-
-                res = trade["result"]
-                pnl = trade.get("pnl", 0.0)
-                msg = f"Trade #{pos_id} closed by broker · {trade['symbol']} · {res} · PnL ${pnl:+.2f}"
-                if res == "WIN":
-                    console.success(msg)
-                elif res == "LOSS":
-                    console.warning(msg)
-                else:
-                    console.info(msg)
 
     # ------------------------------------------------------------------ #
     #  PERSISTENCE HELPERS
