@@ -141,12 +141,24 @@ class IQOptionAuth:
                 self._update_balance_info()
 
             elif name == "balance-changed" and isinstance(msg, dict):
-                b_id = msg.get("id")
-                new_val = msg.get("amount") or msg.get("current_balance")
+                # Protocol format: msg.current_balance = { "id": ..., "amount": ... }
+                cb = msg.get("current_balance")
+                if isinstance(cb, dict):
+                    b_id = cb.get("id")
+                    new_val = cb.get("amount")
+                else:
+                    b_id = msg.get("id")
+                    new_val = msg.get("amount")
                 if b_id == self.active_balance_id and new_val is not None:
                     self.current_balance = float(new_val)
 
+            elif name in ("timeSync", "servertime", "pong"):
+                # Server time sync responses (seconds since epoch)
+                if isinstance(msg, int):
+                    self.server_time = msg
+
             elif name == "heartbeat" and isinstance(msg, int):
+                # Legacy heartbeat (milliseconds since epoch)
                 self.server_time = int(msg / 1000)
 
             if req_id:
@@ -180,10 +192,12 @@ class IQOptionAuth:
         def heartbeat_loop():
             while not self._stop_event.is_set() and self.is_connected:
                 try:
-                    self.send_raw({"name": "heartbeat", "msg": int(time.time() * 1000)})
+                    # Protocol: send "ping" with current unix timestamp (seconds).
+                    # Server replies with "timeSync", keeping our clock in sync.
+                    self.send_raw({"name": "ping", "msg": int(time.time())})
                 except Exception:
                     pass
-                time.sleep(15)
+                time.sleep(5)
 
         self.heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
         self.heartbeat_thread.start()

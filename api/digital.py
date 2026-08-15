@@ -91,16 +91,17 @@ class DigitalAPI:
                 return parsed
         return []
 
-    def calculate_expiration_timestamp(self, execution_time_minutes: int) -> int:
+    def calculate_expiration_timestamp(self, execution_time_seconds: int) -> int:
         """
-        Calculates expiration timestamp formatted for Digital Options (1m, 5m, 15m).
+        Calculates expiration timestamp for Digital Options.
+        `execution_time_seconds` is in SECONDS (e.g. 60 = 1 minute).
         """
         server_time = self.auth.get_server_time()
-        duration_sec = execution_time_minutes * 60
+        duration_sec = max(1, int(execution_time_seconds))
         exp = int(server_time + duration_sec)
-        rem = exp % (execution_time_minutes * 60)
+        rem = exp % duration_sec
         if rem != 0:
-            exp += (execution_time_minutes * 60) - rem
+            exp += duration_sec - rem
         return exp
 
     def place_order(
@@ -108,15 +109,16 @@ class DigitalAPI:
         symbol: str,
         direction: str,
         amount: float,
-        execution_time_minutes: int = 1,
+        execution_time_seconds: int = 60,
     ) -> Dict[str, Any]:
         """
         Places a Digital Option order (CALL/PUT) with the specified duration.
+        `execution_time_seconds` is in SECONDS (e.g. 60 = 1 minute).
         """
         dir_clean = direction.strip().lower()
         call_put = "call" if dir_clean in ["buy", "call"] else "put"
         active_id = self.get_active_id(symbol)
-        exp_time = self.calculate_expiration_timestamp(execution_time_minutes)
+        exp_time = self.calculate_expiration_timestamp(execution_time_seconds)
 
         # IQ Option digital option instrument ID format: do{symbol_upper}{YYYYMMDD}{HHMM}{duration}PT{call_put_letter}
         clean_symbol = symbol.replace("/", "").replace(" ", "").upper()
@@ -132,7 +134,7 @@ class DigitalAPI:
         }
 
         logger.info(
-            f"Placing Digital Option Order: {clean_symbol} | Dir: {call_put.upper()} | Amount: ${amount} | Exp: {execution_time_minutes}m"
+            f"Placing Digital Option Order: {clean_symbol} | Dir: {call_put.upper()} | Amount: ${amount} | Exp: {execution_time_seconds}s"
         )
 
         response = self.auth.send_request(
@@ -155,7 +157,7 @@ class DigitalAPI:
                     "entry_price": float(msg_body.get("open_price", 0.0)),
                     "open_time": msg_body.get("open_time", self.auth.get_server_time()),
                     "expiration_time": exp_time,
-                    "execution_time": execution_time_minutes,
+                    "execution_time": execution_time_seconds,
                 }
 
         # Alternative protocol fallback for digital open-position
@@ -183,7 +185,7 @@ class DigitalAPI:
                 "entry_price": 0.0,
                 "open_time": self.auth.get_server_time(),
                 "expiration_time": exp_time,
-                "execution_time": execution_time_minutes,
+                "execution_time": execution_time_seconds,
             }
 
         return {"success": False, "error": "Digital option order rejected or timed out"}
