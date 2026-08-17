@@ -20,6 +20,7 @@ IqOption/
 │   ├── __init__.py
 │   ├── short_term_option_scalper.py     # Binary/Digital/Bliz scalping
 │   ├── short_term_option_reversal.py    # Binary/Digital/Bliz wick reversal
+│   ├── mtf_confluence_sniper.py         # 30s triple-timeframe confluence sniper
 │   ├── bliz_ema_crossover.py            # Bliz 1m EMA 9/12 bias + 15s EMA 2/3 entry
 │   ├── marginal_gold_scalper.py         # Forex/Marginal XAUUSD 1m scalping
 │   ├── marginal_breakout_pro.py         # Forex/Marginal Donchian breakout
@@ -174,9 +175,55 @@ Then set `STRATEGY=my_custom_strategy` in `.env`. The bot will detect it automat
 1. **`short_term_option_scalper`** — Binary/Digital/Bliz · EMA 9/21, RSI(14), Stochastic(14,3)
 2. **`short_term_option_reversal`** — Binary/Digital/Bliz · Bollinger(20,2), RSI(14), wick rejection
 3. **`bliz_ema_crossover`** — Bliz · two-timeframe EMA crossover (see below)
-4. **`marginal_gold_scalper`** — Forex/Marginal · EMA 20/50/200, MACD, ATR(14)
-5. **`marginal_breakout_pro`** — Forex/Marginal · Donchian(20), ATR volatility expansion
-6. **`marginal_momentum_reversal`** — Forex/Marginal · MACD, Stochastic, engulfing
+4. **`mtf_confluence_sniper`** — Binary/Digital/Bliz · triple-timeframe confluence + hard filters (see below)
+5. **`marginal_gold_scalper`** — Forex/Marginal · EMA 20/50/200, MACD, ATR(14)
+6. **`marginal_breakout_pro`** — Forex/Marginal · Donchian(20), ATR volatility expansion
+7. **`marginal_momentum_reversal`** — Forex/Marginal · MACD, Stochastic, engulfing
+
+### `mtf_confluence_sniper` — Triple-Timeframe High-Accuracy Sniper (30s options)
+
+The most advanced built-in strategy — built for **30-second Binary / Digital / Bliz
+trades** with an accuracy-first, *quality-over-quantity* design. It is a heavy
+**filter first, signal second** system: most candles produce `NO_SIGNAL`, and a
+trade only fires when every layer agrees.
+
+| Timeframe | Source | Role |
+| :--- | :--- | :--- |
+| **5 minutes** | resampled internally from the 1m candles | Macro trend — EMA 6/12 + close location |
+| **1 minute** | `TIMEFRAME=1` | Trend (EMA 9/21 stacked + sloping) & regime filters |
+| **15 seconds** | auto-fetched (`SIGNAL_TIMEFRAME = 15`) | Entry trigger — EMA 3/8 cross **or** pullback-reclaim |
+
+**Hard filters — ALL 5 must pass, otherwise `NO_SIGNAL`:**
+
+1. **Triple-timeframe alignment** — 5m, 1m, and 15s trend must all agree.
+2. **ADX(14) ≥ 18** on 1m — market must be trending; ranging chop is skipped.
+3. **ATR regime** — 1m ATR must sit between 0.65× and 2.20× its own recent
+   median: dead markets *and* news-spike chaos are both skipped.
+4. **Room to move** — price must not be trading straight into a recent 1m
+   swing high/low (needs ≥ 0.5 ATR of room, unless it is breaking through).
+5. **Healthy RSI zone** — BUY only at RSI 50–72, SELL only at 28–50 — never
+   chases exhausted moves.
+
+**Confirmation score — at least 3 of 5 required:**
+
+- MACD(12,26,9) histogram rising/falling with the trade
+- Stochastic(9,3) cross on 15s in trade direction, not exhausted
+- Decisive signal candle (body ≥ 50% of range, close in the trend-side 35%)
+- Previous 15s candle does not strongly oppose the trade
+- Price on the right side of the 1m Bollinger midline without piercing the outer band
+
+Recommended `.env`:
+
+```bash
+MODE=BLIZ            # or BINARY / DIGITAL
+STRATEGY=mtf_confluence_sniper
+TIMEFRAME=1
+EXECUTION_TIME=30    # 30-second expiry
+```
+
+All thresholds (ADX minimum, ATR band, RSI zones, score requirement, etc.) are
+plain constants at the top of `Strategies/mtf_confluence_sniper.py` — tune them
+there if you want the strategy stricter or more active.
 
 ### `bliz_ema_crossover` — Dual-Timeframe EMA Crossover (Bliz)
 
