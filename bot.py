@@ -121,6 +121,16 @@ def validate_config() -> Dict[str, Any]:
 
     exec_time = os.getenv("EXECUTION_TIME", "").strip()
     timeframe = int(os.getenv("TIMEFRAME", "1"))
+
+    timeframe_seconds_str = os.getenv("TIMEFRAME_SECONDS", "").strip()
+    timeframe_seconds: Optional[int] = None
+    if timeframe_seconds_str:
+        try:
+            timeframe_seconds = int(timeframe_seconds_str)
+        except ValueError:
+            console.error(f"Invalid TIMEFRAME_SECONDS '{timeframe_seconds_str}' in .env. Must be an integer (seconds).")
+            sys.exit(1)
+
     strategy = os.getenv("STRATEGY", "marginal_gold_scalper").strip()
     leverage = int(os.getenv("LEVERAGE", "10"))
     stop_loss = float(os.getenv("STOP_LOSS", "2.00"))
@@ -154,7 +164,8 @@ def validate_config() -> Dict[str, Any]:
         "IQ_EMAIL": email, "IQ_PASSWORD": password, "SYMBOL": symbol,
         "ACTIVE_ID": active_id,
         "AMOUNT": amount, "ACCOUNT": account, "MODE": mode,
-        "EXECUTION_TIME": exec_time, "TIMEFRAME": timeframe, "STRATEGY": strategy,
+        "EXECUTION_TIME": exec_time, "TIMEFRAME": timeframe,
+        "TIMEFRAME_SECONDS": timeframe_seconds, "STRATEGY": strategy,
         "LEVERAGE": leverage, "STOP_LOSS": stop_loss, "TAKE_PROFIT": take_profit,
         "MAX_OPEN_TRADES": max_open,
     }
@@ -203,10 +214,15 @@ def main():
     if config.get("ACTIVE_ID"):
         banner_items.append(("ACTIVE_ID", str(config.get("ACTIVE_ID"))))
 
+    if config.get("TIMEFRAME_SECONDS"):
+        tf_display = f"{config.get('TIMEFRAME_SECONDS')} sec"
+    else:
+        tf_display = f"{config.get('TIMEFRAME')} min"
+
     banner_items.extend([
         ("STRATEGY", config.get("STRATEGY")),
         ("ACCOUNT", config.get("ACCOUNT")),
-        ("TIMEFRAME", f"{config.get('TIMEFRAME')} min"),
+        ("TIMEFRAME", tf_display),
         ("AMOUNT", f"${float(config.get('AMOUNT', 10)):.2f}"),
         ("LEVERAGE", f"{config.get('LEVERAGE')}x"),
     ])

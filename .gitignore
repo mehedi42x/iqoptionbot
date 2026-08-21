@@ -14,3 +14,7 @@ env/
 # IDE
 .vscode/
 .idea/
+
+# Backtest generated artifacts & local market data
+backtest/report/
+data/

@@ -92,24 +92,29 @@ class TradingEngine:
         self._update_summary()
         return True
 
-    def _waiting_status(self, symbol: str, timeframe_min: int) -> str:
+    def _waiting_status(self, symbol: str, tf_label: str) -> str:
         with self._trade_lock:
             open_count = len(self.active_trades)
         display_target = f"{symbol}" + (f" (ID:{self.active_id})" if self.active_id else "")
         return (
-            f"Waiting for next candle · {display_target} · {timeframe_min}m · "
+            f"Waiting for next candle · {display_target} · {tf_label} · "
             f"Balance ${self.current_balance:.2f} · Open trades {open_count}"
         )
 
     def start(self):
         self.running = True
-        timeframe_sec = int(self.config.get("TIMEFRAME", 1)) * 60
-        timeframe_min = int(self.config.get("TIMEFRAME", 1))
+        tf_seconds = self.config.get("TIMEFRAME_SECONDS")
+        if tf_seconds:
+            timeframe_sec = int(tf_seconds)
+            tf_label = f"{timeframe_sec}s"
+        else:
+            timeframe_sec = int(self.config.get("TIMEFRAME", 1)) * 60
+            tf_label = f"{int(self.config.get('TIMEFRAME', 1))}m"
         symbol = self.symbol
 
         display_name = f"{symbol}" + (f" (ID:{self.active_id})" if self.active_id else "")
-        console.success(f"Engine started · {self._mode} · {display_name}")
-        console.status(self._waiting_status(symbol, timeframe_min))
+        console.success(f"Engine started · {self._mode} · {display_name} · {tf_label}")
+        console.status(self._waiting_status(symbol, tf_label))
 
         while not self._stop_requested.is_set():
             try:
@@ -164,7 +169,7 @@ class TradingEngine:
                     latest_time = candles[-1].get("from", 0)
 
                 if self.last_candle_timestamp == latest_time:
-                    console.status(self._waiting_status(symbol, timeframe_min))
+                    console.status(self._waiting_status(symbol, tf_label))
                     time.sleep(1)
                     continue
 
@@ -184,16 +189,19 @@ class TradingEngine:
                 if signal in ["BUY", "SELL"]:
                     console.event(f"Signal {signal} · {display_name} @ {candles[-1]['close']}")
                     console.status("Placing order...")
-                    self._execute_signal(signal, candles[-1]["close"])
+                    self._execute_signal(
+                        signal, candles[-1]["close"],
+                        candles=candles, signal_candles=signal_candles,
+                    )
 
-                console.status(self._waiting_status(symbol, timeframe_min))
+                console.status(self._waiting_status(symbol, tf_label))
 
             except Exception as e:
                 console.error(f"Engine loop error: {e}")
                 logger.debug("Engine loop traceback:", exc_info=True)
             time.sleep(1)
 
-    def _execute_signal(self, signal: str, current_price: float):
+    def _execute_signal(self, signal: str, current_price: float, candles=None, signal_candles=None):
         symbol = self.symbol
         amount = float(self.config.get("AMOUNT", 10.0))
 
@@ -202,8 +210,26 @@ class TradingEngine:
             sl_dist = float(self.config.get("STOP_LOSS", 2.0))
             tp_dist = float(self.config.get("TAKE_PROFIT", 4.0))
 
-            sl_price = round(current_price - sl_dist, 4) if signal == "BUY" else round(current_price + sl_dist, 4)
-            tp_price = round(current_price + tp_dist, 4) if signal == "BUY" else round(current_price - tp_dist, 4)
+            # Dynamic ATR-based SL/TP when the strategy provides it (preferred);
+            # otherwise fall back to the fixed .env distances.
+            sl_price = tp_price = atr_entry = None
+            if hasattr(self.strategy_module, "compute_sl_tp"):
+                candle_list = signal_candles or candles or []
+                try:
+                    sl_price, tp_price = self.strategy_module.compute_sl_tp(
+                        candle_list, signal, current_price
+                    )
+                except Exception:
+                    sl_price = tp_price = None
+            if sl_price is None or tp_price is None:
+                sl_price = round(current_price - sl_dist, 4) if signal == "BUY" else round(current_price + sl_dist, 4)
+                tp_price = round(current_price + tp_dist, 4) if signal == "BUY" else round(current_price - tp_dist, 4)
+
+            if hasattr(self.strategy_module, "compute_atr"):
+                try:
+                    atr_entry = self.strategy_module.compute_atr(signal_candles or candles or [])
+                except Exception:
+                    atr_entry = None
 
             logger.debug(f"Executing {signal} — Entry: {current_price}, SL: {sl_price}, TP: {tp_price}")
 
@@ -226,6 +252,8 @@ class TradingEngine:
                     "exit_price": None,
                     "stop_loss": sl_price,
                     "take_profit": tp_price,
+                    "atr_entry": atr_entry,
+                    "trail_stop": sl_price,
                     "open_time": datetime.now(timezone.utc).isoformat(),
                     "close_time": None,
                     "execution_time": None,
@@ -285,7 +313,10 @@ class TradingEngine:
 
     def _get_current_price(self, symbol: str) -> Optional[float]:
         try:
-            tf = int(self.config.get("TIMEFRAME", 1)) * 60
+            if self.config.get("TIMEFRAME_SECONDS"):
+                tf = int(self.config.get("TIMEFRAME_SECONDS"))
+            else:
+                tf = int(self.config.get("TIMEFRAME", 1)) * 60
             candles = self.api.get_candles(symbol, timeframe_seconds=tf, count=5)
             if candles and len(candles) > 0:
                 return float(candles[-1]["close"])
@@ -309,6 +340,21 @@ class TradingEngine:
             current_price = self._get_current_price(symbol)
             if current_price is None:
                 continue
+
+            # Optional ATR-based trailing stop (bot-managed): ratchet the SL
+            # level in profit so gains are locked in as the price moves.
+            trail_mult = getattr(self.strategy_module, "TRAIL_ATR_MULT", None)
+            atr_entry = trade.get("atr_entry")
+            if trail_mult and atr_entry:
+                if direction == "BUY":
+                    trail = current_price - float(trail_mult) * float(atr_entry)
+                    if trail > (sl if sl is not None else float("-inf")):
+                        sl = trail
+                elif direction == "SELL":
+                    trail = current_price + float(trail_mult) * float(atr_entry)
+                    if trail < (sl if sl is not None else float("inf")):
+                        sl = trail
+                trade["stop_loss"] = sl
 
             hit_reason = None
             if direction == "BUY":

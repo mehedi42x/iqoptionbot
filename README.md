@@ -249,6 +249,52 @@ shipping configuration).
 
 ---
 
+## 🎯 PRO 15s Forex Scalper (800x) + Backtest Suite
+
+This branch adds a dedicated **15-second** leveraged-CFD strategy plus a
+walk-forward backtesting suite that tests **9 different strategies** and ranks
+them to pick the best.
+
+### `pro_15s_forex` — Donchian(30) breakout scalper
+
+The winner of the backtest (full report: `backtest/report/backtest_report.md`):
+
+| Layer | Rule |
+| :--- | :--- |
+| **Entry** | BUY when the 15s close breaks **above** the prior 30-bar high · SELL when it breaks **below** the prior 30-bar low |
+| **Stop loss** | `2 × ATR(14)` from entry — dynamic, bot-managed |
+| **Take profit** | `3 × ATR(14)` from entry — dynamic, bot-managed |
+| **Trailing stop** | `2 × ATR(14)` behind price — ratchets the SL to lock in profit |
+| **Time-stop** | force-close after 40 bars if neither SL nor TP hit |
+
+Recommended `.env`:
+
+```bash
+MODE=MARGINAL           # forex / CFD (continuous SL/TP)
+STRATEGY=pro_15s_forex
+TIMEFRAME_SECONDS=15    # trade on 15-second candles (new option)
+LEVERAGE=800
+AMOUNT=10
+MAX_OPEN_TRADES=1
+```
+
+> When the strategy provides ATR-based exits, the fixed `STOP_LOSS` /
+> `TAKE_PROFIT` values in `.env` are ignored and the stop is sized from live
+> ATR instead — essential at 800x, where a stop wider than ~0.125% would be
+> liquidated before it ever triggered.
+
+### Backtesting
+
+```bash
+pip3 install -r requirements.txt matplotlib
+python3 -m backtest.run_backtest --data your_candles.csv --spread 0.00015
+```
+
+`backtest/README.md` documents the accepted candle CSV format and the full
+methodology (walk-forward split, no-lookahead fill model, spread + liquidation).
+
+---
+
 ## ⏱️ Execution Time (in Seconds)
 
 `EXECUTION_TIME` is specified in **seconds**, not minutes:
