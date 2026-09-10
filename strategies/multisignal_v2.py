@@ -1,4 +1,3 @@
-from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -13,16 +12,15 @@ class Candle:
 
 
 class Strategy:
-    """MultiSignal v2 — MS1 + S9b swap (first system over 60% WR). NO EMA.
+    """MultiSignal v2 — MS1 + S9b swap (60.25% WR). NO EMA.
+
+    Written in the same structure as strategies/emacombo.py
+    (candles_1m list, _update_1m, same get_status keys).
 
     S9b = cut L3 (h12/15 extremes: FULL 50.3% WR) + add D2
     (calm-regime 0.85-0.90 mids: FULL 56.5% WR, 3/3 months green).
     Validated as ONE combo: dW=+7, dL=-102, TR +$1,002, HO +$77.5
-    (@$10), every month net-UP and losers-DOWN, WR 59.65% -> 60.26%.
-    11 other loser-cutting strategies tested (cooldowns, daily stop-loss,
-    vr filters, post-doji, bar-raise, 3 more swaps): ALL FAIL —
-    every ~60%-WR slice loses more winners than losers when cut.
-    Only swapping a 50%-slice for a 56%-slice threads the needle.
+    (@$10), every month net-UP and losers-DOWN, WR 59.65% -> 60.25%.
 
     Router: weak hours trimmed; skip {3,20,21,22} >=0.80;
     skip {20,21,22}+calm >=0.75; monster {19,23} >=0.90;
@@ -31,7 +29,9 @@ class Strategy:
     Toggles: ENABLE_H1215_TRIM / ENABLE_CALM_MID (both False = MS1).
     """
 
+    # Only 60s timeframe is needed
     required_timeframes = [60]
+    MAX_1M_CANDLES = 300
 
     POS_MIN = 0.93
     POS_MIN_SKIP = 0.80
@@ -46,6 +46,7 @@ class Strategy:
     VOL_FAST = 5
     VOL_SLOW = 60
     VOL_CALM_MAX = 0.864
+    ATR_PERIOD = 14
     ENABLE_SKIP_EXTENSION = True
     ENABLE_HOUR_TRIM = True
     ENABLE_NORMAL_FADES = True
@@ -58,15 +59,18 @@ class Strategy:
         self.reset()
 
     def reset(self):
+        self.candles_1m = []
+        self.ema9_1m = None
+        self.ema12_1m = None
+        self.atr_1m = None
+        self.market_direction = "NEUTRAL"
         self.last_1m_timestamp = None
-        self.last_candle = None
         self.last_signal_timestamp = None
         self.last_signal = None
         self.last_module = None
         self.last_pos = None
         self.last_vol_ratio = None
         self.last_regime = None
-        self._ranges = deque(maxlen=self.VOL_SLOW)
         self.no_trade = True
         self.no_trade_reason = "WAIT_FIRST_CANDLE"
 
@@ -104,25 +108,39 @@ class Strategy:
         return Candle(float(ts), float(o), float(h), float(l), float(c))
 
     @staticmethod
+    def _atr(candles, period):
+        if len(candles) < period + 1:
+            return None
+        trs = []
+        for i in range(len(candles) - period, len(candles)):
+            cur, prev = candles[i], candles[i - 1]
+            trs.append(
+                max(
+                    cur.high - cur.low,
+                    abs(cur.high - prev.close),
+                    abs(cur.low - prev.close),
+                )
+            )
+        return sum(trs) / period
+
+    @staticmethod
     def _utc_hour(ts):
         if ts > 1e11:
             ts = ts / 1000.0
         return datetime.fromtimestamp(ts, tz=timezone.utc).hour
 
-    def _regime(self):
-        if len(self._ranges) < self.VOL_SLOW:
-            return None
-        fast = sum(list(self._ranges)[-self.VOL_FAST:]) / self.VOL_FAST
-        slow = sum(self._ranges) / self.VOL_SLOW
-        if slow <= 0:
-            return None
-        self.last_vol_ratio = fast / slow
-        return "calm" if self.last_vol_ratio < self.VOL_CALM_MAX else "normal"
-
-    def _evaluate(self, k):
+    def _update_1m(self):
+        completed = self.candles_1m[:-1]
         self.last_module = None
         self.last_pos = None
 
+        if len(completed) < 1:
+            self.no_trade, self.no_trade_reason = True, "WAIT_FIRST_CANDLE"
+            return None
+
+        self.atr_1m = self._atr(completed, self.ATR_PERIOD)
+
+        k = completed[-1]
         rng = k.high - k.low
         if rng <= 0:
             self.no_trade, self.no_trade_reason = True, "FLAT_CANDLE"
@@ -152,9 +170,20 @@ class Strategy:
             and not skip_hour
             and hour in self.MONSTER_HOURS_UTC
         )
-        regime = self._regime()
-        self.last_regime = regime
-        calm = regime == "calm"
+
+        # Auto-detect: calm / normal / warming up (trailing 60 ranges)
+        self.last_vol_ratio = None
+        self.last_regime = None
+        calm = False
+        if len(completed) >= self.VOL_SLOW:
+            trailing = [c.high - c.low for c in completed[-self.VOL_SLOW:]]
+            slow = sum(trailing) / self.VOL_SLOW
+            if slow > 0:
+                fast = sum(trailing[-self.VOL_FAST:]) / self.VOL_FAST
+                self.last_vol_ratio = fast / slow
+                self.last_regime = "calm" if self.last_vol_ratio < self.VOL_CALM_MAX else "normal"
+                calm = self.last_regime == "calm"
+
         skip_calm = (
             self.ENABLE_SKIP_CALM_LOWER
             and skip_hour
@@ -199,38 +228,43 @@ class Strategy:
         except (TypeError, ValueError):
             return None
 
-        if timeframe != 60:
-            return None
+        if timeframe == 60:
+            new_candle = not (
+                self.last_1m_timestamp and candle.timestamp == self.last_1m_timestamp
+            )
 
-        if self.last_1m_timestamp is not None and candle.timestamp == self.last_1m_timestamp:
-            return None
+            if new_candle:
+                self.last_1m_timestamp = candle.timestamp
+                self.candles_1m.append(candle)
+                if len(self.candles_1m) > self.MAX_1M_CANDLES:
+                    self.candles_1m.pop(0)
+            else:
+                self.candles_1m[-1] = candle
 
-        self.last_1m_timestamp = candle.timestamp
-        just_closed = self.last_candle
-        self.last_candle = candle
+            signal = self._update_1m()
 
-        if just_closed is None:
-            return None
-        self._ranges.append(just_closed.high - just_closed.low)
+            if not new_candle or signal is None or len(self.candles_1m) < 2:
+                return None
 
-        signal = self._evaluate(just_closed)
-        if signal is None:
-            return None
-        if just_closed.timestamp == self.last_signal_timestamp:
-            return None
-        self.last_signal_timestamp = just_closed.timestamp
-        self.last_signal = signal
-        return signal
+            closed_ts = self.candles_1m[-2].timestamp
+            if closed_ts == self.last_signal_timestamp:
+                return None
+
+            self.last_signal_timestamp = closed_ts
+            self.last_signal = signal
+            return signal
+
+        return None
 
     def update_60s(self, candle):
         return self.update_candle(60, candle)
 
     def get_status(self):
         return {
-            "direction": "NEUTRAL",
-            "ema9_1m": None,
-            "ema12_1m": None,
-            "atr_1m": None,
+            "direction": self.market_direction,
+            "ema9_1m": self.ema9_1m,
+            "ema12_1m": self.ema12_1m,
+            "atr_1m": self.atr_1m,
             "last_pos": self.last_pos,
             "vol_ratio": self.last_vol_ratio,
             "regime": self.last_regime,
