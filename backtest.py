@@ -217,6 +217,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--strategy", default="emacombo")
     ap.add_argument("--prefix", default="backtest")
+    ap.add_argument("--payout", type=float, default=BASE_PAYOUT)
     args = ap.parse_args()
 
     Strategy = importlib.import_module(f"strategies.{args.strategy}").Strategy
@@ -236,7 +237,7 @@ def main():
 
     for exp in EXPIRATIONS:
         trades, skipped, incomplete, reasons = run_backtest(candles, exp, Strategy)
-        s = summarize(trades, BASE_PAYOUT, f"expiry={exp}s")
+        s = summarize(trades, args.payout, f"expiry={exp}s")
         s["skipped_overlap"] = skipped
         s["incomplete_at_end"] = incomplete
         print(f"\n=== Expiry {exp}s === "
@@ -261,7 +262,7 @@ def main():
             for key in ("module", "direction", "market_direction", "sig_hour",
                         "sig_weekday", "sig_month", "gap_entry",
                         "contiguous_expiry"):
-                all_results[f"by_{key}"] = breakdown(trades, key, BASE_PAYOUT)
+                all_results[f"by_{key}"] = breakdown(trades, key, args.payout)
 
             # per-trade CSV
             tpath = f"{args.prefix}_trades_60s.csv"
