@@ -1,4 +1,5 @@
 {
+  "strategy": "emacombo",
   "data": {
     "candles": 61419,
     "first": "2026-07-12 21:01 UTC",

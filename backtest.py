@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Backtest for strategies/emacombo.py on candles_asset_1861_60s_365d.csv
+Backtest for strategies/* on candles_asset_1861_60s_365d.csv
 
 Replicates the LIVE bot behaviour exactly:
   - Candles are fed one-by-one, in chronological order, into
@@ -15,14 +15,18 @@ Replicates the LIVE bot behaviour exactly:
 No look-ahead: the strategy only ever sees completed[:-1] internally.
 
 Stdlib only (no pandas/numpy needed).
+
+Usage:
+  python3 backtest.py                                  # v1 (emacombo)
+  python3 backtest.py --strategy emacombo_v2 --prefix backtest_v2
 """
+import argparse
 import csv
+import importlib
 import json
 import math
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
-
-from strategies.emacombo import Strategy
 
 CSV_FILE = "candles_asset_1861_60s_365d.csv"
 EXPIRATIONS = [60, 120, 300]   # primary = 60s
@@ -47,7 +51,7 @@ def load_candles(path):
     return rows
 
 
-def run_backtest(candles, expiration):
+def run_backtest(candles, expiration, Strategy):
     strat = Strategy()
     ts = [c["timestamp"] for c in candles]
     index_of = {t: i for i, t in enumerate(ts)}
@@ -210,20 +214,28 @@ def breakdown(trades, key, payout):
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--strategy", default="emacombo")
+    ap.add_argument("--prefix", default="backtest")
+    args = ap.parse_args()
+
+    Strategy = importlib.import_module(f"strategies.{args.strategy}").Strategy
+    print(f"Strategy: strategies.{args.strategy} -> prefix '{args.prefix}'")
+
     candles = load_candles(CSV_FILE)
     first = datetime.fromtimestamp(candles[0]["timestamp"], tz=timezone.utc)
     last = datetime.fromtimestamp(candles[-1]["timestamp"], tz=timezone.utc)
     print(f"Candles: {len(candles)} | {first} -> {last} "
           f"({(candles[-1]['timestamp'] - candles[0]['timestamp']) / 86400:.1f} days)")
 
-    all_results = {"data": {"candles": len(candles),
+    all_results = {"strategy": args.strategy,
+                   "data": {"candles": len(candles),
                             "first": first.strftime("%Y-%m-%d %H:%M UTC"),
                             "last": last.strftime("%Y-%m-%d %H:%M UTC"),
                             "days": round((candles[-1]["timestamp"] - candles[0]["timestamp"]) / 86400, 1)}}
 
-    primary_trades = None
     for exp in EXPIRATIONS:
-        trades, skipped, incomplete, reasons = run_backtest(candles, exp)
+        trades, skipped, incomplete, reasons = run_backtest(candles, exp, Strategy)
         s = summarize(trades, BASE_PAYOUT, f"expiry={exp}s")
         s["skipped_overlap"] = skipped
         s["incomplete_at_end"] = incomplete
@@ -233,7 +245,6 @@ def main():
               f"(skipped_overlap={skipped}, incomplete={incomplete})")
         all_results[f"expiry_{exp}s"] = {k: v for k, v in s.items() if k != "_curve"}
         if exp == 60:
-            primary_trades = trades
             all_results["no_trade_reasons"] = dict(reasons.most_common())
 
             # payout sensitivity
@@ -253,16 +264,18 @@ def main():
                 all_results[f"by_{key}"] = breakdown(trades, key, BASE_PAYOUT)
 
             # per-trade CSV
-            with open("backtest_trades_60s.csv", "w", newline="") as f:
+            tpath = f"{args.prefix}_trades_60s.csv"
+            with open(tpath, "w", newline="") as f:
                 w = csv.DictWriter(f, fieldnames=list(trades[0].keys()))
                 w.writeheader()
                 w.writerows(trades)
-            print(f"wrote backtest_trades_60s.csv ({len(trades)} trades)")
+            print(f"wrote {tpath} ({len(trades)} trades)")
             all_results["expiry_60s"]["equity_curve_R"] = s["_curve"]
 
-    with open("backtest_summary.json", "w") as f:
+    spath = f"{args.prefix}_summary.json"
+    with open(spath, "w") as f:
         json.dump(all_results, f, indent=2)
-    print("wrote backtest_summary.json")
+    print(f"wrote {spath}")
 
 
 if __name__ == "__main__":
