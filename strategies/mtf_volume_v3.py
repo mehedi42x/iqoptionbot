@@ -12,11 +12,11 @@ class Candle:
 
 
 class Strategy:
-    """MTF-Volume v2 — U5 = U4 + E1B@h20 add + H06-FADE veto (S3 swap).
+    """MTF-Volume v3 — U6 = U5 + E1B@h04 + E1B@h23-refined (B9+B4b combo).
 
-    Validated (Aug11-Sep10, TRAIN Aug11-31 / HO Sep1-10): n=6293, 60.43% WR,
-    +702.2R (@$1, 85%); dW=+39, dL=-25, dWR=+0.51pp vs U4; TR +$20.4, HO +$27.7,
-    3/3 blocks up, 25/27 days green. Labs: lab_comb_mtf{,2,3}.py.
+    Validated (Aug11-Sep10, TRAIN Aug11-31 / HO Sep1-10): n=6741, 60.44% WR,
+    +752.3R (@$1, 85%); dW=+252, dL=+164, dWR=+0.01pp vs U5; TR +$22.2, HO +$28.1,
+    3/3 blocks up. U5 = U4 + E1B@h20 + H06-FADE veto. Labs: lab_u6_1/2 (+R3-R5).
 
     Multi-timeframe volume system. Beats MS2-on-window (Aug20-Sep10) on ALL FOUR:
     count +14.1% (3986 -> 4549), WR 59.18% -> 59.40%, TR +$120.1 -> +$149.6,
@@ -26,9 +26,9 @@ class Strategy:
       MS2  1m fades, verbatim multisignal_v2 rules (FADE/SKIP/MONSTER/CALM_MID/
            SKIP_CALM). Signal-bar hour; weak {8,9,10,11,13,14} + h{12,15}
            trimmed (calm-mids exempt).
-      E1B  30s entries, ENTRY hour in {20,21,22} UTC (h20 added in U5);
-           30s fade pos>=0.80; 30s-range / 1m-ctx-ATR60mean < 1.0.
-           Skipped where MS2 already fired at the same entry ts.
+      E1B  30s entries, ENTRY hour in {4,20,21,22} UTC (plain: pos>=0.80,
+           size<1.0) + h23 REFINED (pos>=0.80, size<1.0, and vs-1m-trend or
+           size<0.75); h23-plain dilutive (rejected). Skipped where MS2 fired.
       H06  veto: normal-FADE entries at 06:xx skipped when fade rides WITH the
            1m trend (warmup counts as with-side) or signal range/ATR60>=1.5.
       G1M  1m entries: 1m-mid 0.85<=pos<0.93 (non-skip, non-weak, calm-mid
@@ -68,7 +68,8 @@ class Strategy:
     ENABLE_CALM_MID = True
 
     # ---- E1B 30s sniper leg ----
-    E1B_HOURS_UTC = {20, 21, 22}
+    E1B_HOURS_UTC = {4, 20, 21, 22, 23}
+    E1B23_SMALL_MAX = 0.75  # h23 refined: pass iff vs-trend OR size<0.75 (B9)
     E1B_POS_MIN = 0.80
     E1B_SIZE_MAX = 1.0
 
@@ -282,8 +283,19 @@ class Strategy:
         if atr is None or atr <= 0:
             return None, None, "WARMUP_1M_CTX"
         self.atr_1m = atr
-        if f["rng"] / atr >= self.E1B_SIZE_MAX:
+        size = f["rng"] / atr
+        if size >= self.E1B_SIZE_MAX:
             return None, None, "E1B_SIZE"
+        if self._utc_hour(entry_ts) == 23 and size >= self.E1B23_SMALL_MAX:
+            vs = False
+            if ctx is not None and ctx >= 50:
+                s50 = sum(c.close for c in self.candles_1m[ctx - 49:ctx + 1]) / 50.0
+                s20 = sum(c.close for c in self.candles_1m[ctx - 19:ctx + 1]) / 20.0
+                cc = self.candles_1m[ctx].close
+                trend = 1 if (cc > s50 and s20 > s50) else (-1 if (cc < s50 and s20 < s50) else 0)
+                vs = (trend == 1 and f["dir"] == "PUT") or (trend == -1 and f["dir"] == "CALL")
+            if not vs:
+                return None, None, "E1B23_FILTER"
         return f["dir"], "E1B_30S", None
 
     def _g1m_leg(self, entry_ts):
