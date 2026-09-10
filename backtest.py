@@ -29,6 +29,8 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
 CSV_FILE = "candles_asset_1861_60s_365d.csv"
+CSV30_FILE = "candles_asset_1861_30s_30d.csv"
+CSV60_FILE = "candles_asset_1861_60s_30d.csv"
 EXPIRATIONS = [60, 120, 300]   # primary = 60s
 PAYOUTS = [0.70, 0.75, 0.80, 0.85, 0.90]
 BASE_PAYOUT = 0.80             # IQ Option typical ~70-90%
@@ -112,6 +114,101 @@ def run_backtest(candles, expiration, Strategy):
             "entry_dt": datetime.fromtimestamp(entry_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
             "expiry_dt": datetime.fromtimestamp(expiry_time, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
             "direction": signal,
+            "module": st.get("last_module"),
+            "market_direction": st.get("direction"),
+            "entry_price": entry_price,
+            "expiry_price": expiry_price,
+            "result": result,
+            "pips": (expiry_price - entry_price) * (1 if signal == "CALL" else -1),
+            "gap_entry": gap_entry,
+            "contiguous_expiry": contiguous,
+            "sig_hour": datetime.fromtimestamp(closed["timestamp"], tz=timezone.utc).hour,
+            "sig_weekday": datetime.fromtimestamp(closed["timestamp"], tz=timezone.utc).strftime("%a"),
+            "sig_month": datetime.fromtimestamp(closed["timestamp"], tz=timezone.utc).strftime("%Y-%m"),
+            "ema9": st.get("ema9_1m"),
+            "ema12": st.get("ema12_1m"),
+            "atr": st.get("atr_1m"),
+        })
+        busy_until = expiry_time
+
+    return trades, skipped_overlap, incomplete_at_end, no_trade_reasons
+
+
+def run_backtest_mtf(candles30, candles60, expiration, Strategy):
+    """Multi-timeframe backtest (30s + 60s interleaved, chronological).
+
+    Replicates the LIVE bot: each TF subscription delivers its candles, and
+    the strategy routes via Strategy.update_candle(tf, candle). At shared
+    :00 boundaries the 60s candle is fed first, then the 30s candle
+    (deterministic tie order; strategies use order-independent ctx scans).
+    Expiry/settlement is evaluated in the ENTRY timeframe's series.
+    """
+    strat = Strategy()
+    series = {30: candles30, 60: candles60}
+    ts = {tf: [c["timestamp"] for c in s] for tf, s in series.items()}
+    index_of = {tf: {t: i for i, t in enumerate(ts[tf])} for tf in series}
+
+    events = []
+    for tf in (60, 30):
+        for i, c in enumerate(series[tf]):
+            events.append((c["timestamp"], tf, i))
+    # 60s before 30s at the same ts
+    events.sort(key=lambda e: (e[0], 0 if e[1] == 60 else 1))
+
+    trades = []
+    skipped_overlap = 0
+    incomplete_at_end = 0
+    no_trade_reasons = Counter()
+    busy_until = None
+
+    for entry_ts, tf, i in events:
+        c = series[tf][i]
+        signal = strat.update_candle(tf, dict(c))
+        st = strat.get_status()
+        if signal is None:
+            no_trade_reasons[st.get("no_trade_reason") or "UNKNOWN"] += 1
+            continue
+
+        entry_price = c["open"]
+
+        if busy_until is not None and entry_ts < busy_until:
+            skipped_overlap += 1
+            continue
+
+        expiry_time = entry_ts + expiration
+        idx = index_of[tf]
+        if expiry_time in idx:
+            j = idx[expiry_time]
+            expiry_price = series[tf][j]["open"]
+            contiguous = (j == i + expiration // tf)
+        else:
+            j = None
+            tfs = ts[tf]
+            for k in range(len(tfs) - 1, -1, -1):
+                if tfs[k] <= expiry_time:
+                    j = k
+                    break
+            if j is None or j <= i:
+                incomplete_at_end += 1
+                continue
+            expiry_price = series[tf][j]["close"]
+            contiguous = False
+
+        if signal == "CALL":
+            result = "WIN" if expiry_price > entry_price else ("DRAW" if expiry_price == entry_price else "LOSS")
+        else:
+            result = "WIN" if expiry_price < entry_price else ("DRAW" if expiry_price == entry_price else "LOSS")
+
+        closed = series[tf][i - 1] if i > 0 else series[tf][i]
+        gap_entry = (entry_ts - ts[tf][i - 1]) != tf if i > 0 else False
+
+        trades.append({
+            "n": len(trades) + 1,
+            "entry_time": entry_ts,
+            "entry_dt": datetime.fromtimestamp(entry_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
+            "expiry_dt": datetime.fromtimestamp(expiry_time, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            "direction": signal,
+            "tf": tf,
             "module": st.get("last_module"),
             "market_direction": st.get("direction"),
             "entry_price": entry_price,
@@ -218,25 +315,50 @@ def main():
     ap.add_argument("--strategy", default="emacombo")
     ap.add_argument("--prefix", default="backtest")
     ap.add_argument("--payout", type=float, default=BASE_PAYOUT)
+    ap.add_argument("--mtf", action="store_true",
+                    help="multi-TF mode: interleave 30s + 60s feeds")
+    ap.add_argument("--csv30", default=CSV30_FILE)
+    ap.add_argument("--csv60", default=CSV60_FILE)
     args = ap.parse_args()
 
     Strategy = importlib.import_module(f"strategies.{args.strategy}").Strategy
-    print(f"Strategy: strategies.{args.strategy} -> prefix '{args.prefix}'")
+    print(f"Strategy: strategies.{args.strategy} -> prefix '{args.prefix}'"
+          + (" [MTF 30s+60s]" if args.mtf else ""))
 
-    candles = load_candles(CSV_FILE)
-    first = datetime.fromtimestamp(candles[0]["timestamp"], tz=timezone.utc)
-    last = datetime.fromtimestamp(candles[-1]["timestamp"], tz=timezone.utc)
-    print(f"Candles: {len(candles)} | {first} -> {last} "
-          f"({(candles[-1]['timestamp'] - candles[0]['timestamp']) / 86400:.1f} days)")
+    if args.mtf:
+        candles30 = load_candles(args.csv30)[:-1]  # drop forming tail (same as lab)
+        candles60 = load_candles(args.csv60)[:-1]
+        first = datetime.fromtimestamp(candles30[0]["timestamp"], tz=timezone.utc)
+        last = datetime.fromtimestamp(candles30[-1]["timestamp"], tz=timezone.utc)
+        print(f"Candles30: {len(candles30)} | {first} -> {last}")
+        first60 = datetime.fromtimestamp(candles60[0]["timestamp"], tz=timezone.utc)
+        last60 = datetime.fromtimestamp(candles60[-1]["timestamp"], tz=timezone.utc)
+        print(f"Candles60: {len(candles60)} | {first60} -> {last60}")
+        all_results = {"strategy": args.strategy,
+                       "mode": "mtf",
+                       "data": {"candles30": len(candles30), "csv30": args.csv30,
+                                "candles60": len(candles60), "csv60": args.csv60,
+                                "first": first.strftime("%Y-%m-%d %H:%M UTC"),
+                                "last": last.strftime("%Y-%m-%d %H:%M UTC")}}
+    else:
+        candles = load_candles(CSV_FILE)
+        first = datetime.fromtimestamp(candles[0]["timestamp"], tz=timezone.utc)
+        last = datetime.fromtimestamp(candles[-1]["timestamp"], tz=timezone.utc)
+        print(f"Candles: {len(candles)} | {first} -> {last} "
+              f"({(candles[-1]['timestamp'] - candles[0]['timestamp']) / 86400:.1f} days)")
 
-    all_results = {"strategy": args.strategy,
-                   "data": {"candles": len(candles),
-                            "first": first.strftime("%Y-%m-%d %H:%M UTC"),
-                            "last": last.strftime("%Y-%m-%d %H:%M UTC"),
-                            "days": round((candles[-1]["timestamp"] - candles[0]["timestamp"]) / 86400, 1)}}
+        all_results = {"strategy": args.strategy,
+                       "data": {"candles": len(candles),
+                                "first": first.strftime("%Y-%m-%d %H:%M UTC"),
+                                "last": last.strftime("%Y-%m-%d %H:%M UTC"),
+                                "days": round((candles[-1]["timestamp"] - candles[0]["timestamp"]) / 86400, 1)}}
 
     for exp in EXPIRATIONS:
-        trades, skipped, incomplete, reasons = run_backtest(candles, exp, Strategy)
+        if args.mtf:
+            trades, skipped, incomplete, reasons = run_backtest_mtf(
+                candles30, candles60, exp, Strategy)
+        else:
+            trades, skipped, incomplete, reasons = run_backtest(candles, exp, Strategy)
         s = summarize(trades, args.payout, f"expiry={exp}s")
         s["skipped_overlap"] = skipped
         s["incomplete_at_end"] = incomplete
@@ -259,9 +381,12 @@ def main():
             all_results["payout_sensitivity_60s"] = sens
 
             # breakdowns @80%
-            for key in ("module", "direction", "market_direction", "sig_hour",
-                        "sig_weekday", "sig_month", "gap_entry",
-                        "contiguous_expiry"):
+            bkeys = ["module", "direction", "market_direction", "sig_hour",
+                     "sig_weekday", "sig_month", "gap_entry",
+                     "contiguous_expiry"]
+            if args.mtf:
+                bkeys.append("tf")
+            for key in bkeys:
                 all_results[f"by_{key}"] = breakdown(trades, key, args.payout)
 
             # per-trade CSV
