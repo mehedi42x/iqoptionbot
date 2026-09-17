@@ -1,11 +1,10 @@
 """
 IQ Option live trading engine for the web dashboard.
 
-This is a refactor of bot.py -- the WebSocket protocol, login flow,
-candle subscription, order payload and result handling are byte-for-byte
-the same as the working CLI bot. The only difference is that instead of
-printing to a rich Console, every event is pushed onto an in-memory event
-bus which the FastAPI layer streams to the browser over WebSocket.
+The WebSocket protocol, login flow, candle subscription, order payload and
+result handling follow the supplied IQ Option reference bot. Instead of
+printing to a console, every event is pushed onto an in-memory event bus which
+the FastAPI layer streams to the browser over WebSocket.
 """
 from __future__ import annotations
 
@@ -13,11 +12,9 @@ import json
 import ssl
 import time
 import threading
-import importlib
 import importlib.util
 import traceback
 from collections import deque
-from datetime import datetime, timezone
 
 import requests
 import websocket
@@ -25,16 +22,15 @@ import websocket
 LOGIN_URL = "https://auth.iqoption.com/api/v2/login"
 WS_URL = "wss://iqoption.com/echo/websocket"
 
-# option_type_id used by binary-options.open-option
-OPTION_TYPE_IDS = {
-    "binary": 1,
-    "turbo": 3,
-}
-
+# The web app does not ship an account, asset, or strategy configuration.
+# Everything is supplied by the user through Account & Risk and Script Lab.
 ACCOUNT_TYPE_IDS = {
     "PRACTICE": 4,
     "REAL": 1,
 }
+
+# Keep the broker payload aligned with the supplied WebSocket reference.
+OPTION_TYPE_ID = 12
 
 
 def now_ms() -> int:
@@ -74,42 +70,46 @@ class EventBus:
 
 
 class StrategyRunner:
-    """Loads a python strategy module/source and feeds candles to it."""
+    """Load one user-authored Script Lab strategy from a Python source file."""
 
-    def __init__(self, module_name: str | None = None, source_path: str | None = None):
-        self.name = module_name or (source_path or "unknown")
-        if source_path:
-            spec = importlib.util.spec_from_file_location(
-                f"user_strategy_{int(time.time())}", source_path
-            )
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)  # type: ignore
-        else:
-            module = importlib.import_module(f"strategies.{module_name}")
-            module = importlib.reload(module)
+    def __init__(self, source_path: str):
+        if not source_path:
+            raise RuntimeError("Create and save a strategy in Script Lab first.")
+        self.name = source_path
+        spec = importlib.util.spec_from_file_location(
+            f"user_strategy_{int(time.time() * 1000000)}", source_path
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError("Could not load the strategy source file")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
         if not hasattr(module, "Strategy"):
             raise RuntimeError("Strategy file must define a class named `Strategy`")
         self.module = module
         self.strategy = module.Strategy()
 
     def required_timeframes(self) -> list[int]:
+        """Discover timeframes exactly as the supplied bot contract does."""
         s = self.strategy
-        tfs = None
         if hasattr(s, "get_required_timeframes"):
-            tfs = s.get_required_timeframes()
+            timeframes = s.get_required_timeframes()
         elif hasattr(s, "required_timeframes"):
-            tfs = s.required_timeframes
+            timeframes = s.required_timeframes
+        else:
+            timeframes = [60]
+
         out = set()
-        for tf in tfs or [60]:
+        for timeframe in timeframes or []:
             try:
-                tf = int(tf)
-                if tf > 0:
-                    out.add(tf)
+                timeframe = int(timeframe)
+                if timeframe > 0:
+                    out.add(timeframe)
             except (TypeError, ValueError):
                 continue
         return sorted(out) or [60]
 
     def feed(self, timeframe: int, candle: dict):
+        """Use the universal contract, then the reference bot's legacy fallbacks."""
         s = self.strategy
         if hasattr(s, "update_candle"):
             return s.update_candle(timeframe, candle)
@@ -123,7 +123,8 @@ class StrategyRunner:
     def status(self) -> dict:
         if hasattr(self.strategy, "get_status"):
             try:
-                return self.strategy.get_status()
+                value = self.strategy.get_status()
+                return value if isinstance(value, dict) else {}
             except Exception:
                 return {}
         return {}
@@ -137,13 +138,12 @@ class IQOptionEngine:
         # ---- account config -------------------------------------------
         self.email = ""
         self.password = ""
-        self.account_type = "PRACTICE"
-        self.trade_type = "turbo"          # turbo | binary | digital
-        self.active_id = 1
-        self.active_name = "EURUSD"
-        self.amount = 1.0
-        self.expiration = 60
-        self.max_concurrent_trades = 1
+        self.account_type = None
+        self.active_id = None
+        self.active_name = ""
+        self.amount = None
+        self.expiration = None
+        self.max_concurrent_trades = None
 
         # ---- connection state -----------------------------------------
         self.ssid = None
@@ -156,15 +156,14 @@ class IQOptionEngine:
         self.request_id = 0
         self.is_connected = False
         self._stop = False
-        self._watchdog = None
 
         # ---- trading state --------------------------------------------
         self.auto_trading = False
         self.runner: StrategyRunner | None = None
         self.strategy_label = None
-        self.required_timeframes = [60]
-        self.chart_timeframe = 60
-        self.candles: dict[int, list] = {60: []}
+        self.required_timeframes: list[int] = []
+        self.chart_timeframe: int | None = None
+        self.candles: dict[int, list] = {}
         self.subscribed: set[int] = set()
 
         self.active_trades_count = 0
@@ -205,7 +204,6 @@ class IQOptionEngine:
                 "connected": self.is_connected,
                 "email": self.email,
                 "account_type": self.account_type,
-                "trade_type": self.trade_type,
                 "balance": round(self.balance_amount, 2),
                 "currency": self.currency,
                 "user_id": self.profile.get("user_id"),
@@ -239,8 +237,8 @@ class IQOptionEngine:
     def configure(self, **kw):
         with self.lock:
             for key in (
-                "email", "password", "account_type", "trade_type", "active_id",
-                "active_name", "amount", "expiration", "max_concurrent_trades",
+                "email", "password", "account_type", "active_id", "active_name",
+                "amount", "expiration", "max_concurrent_trades",
             ):
                 if key in kw and kw[key] is not None:
                     value = kw[key]
@@ -279,6 +277,24 @@ class IQOptionEngine:
         if self.is_connected:
             self.log("Already connected.", "warn")
             return True
+
+        missing = []
+        for key, value in (
+            ("email", self.email),
+            ("password", self.password),
+            ("account type", self.account_type),
+            ("ACTIVE_ID", self.active_id),
+            ("trade amount", self.amount),
+            ("expiration", self.expiration),
+            ("max concurrent trades", self.max_concurrent_trades),
+            ("Script Lab strategy", self.runner),
+        ):
+            if value in (None, ""):
+                missing.append(key)
+        if missing:
+            self.log("Complete Account & Risk first: " + ", ".join(missing), "error")
+            return False
+
         if not self.login():
             return False
         self._stop = False
@@ -292,16 +308,9 @@ class IQOptionEngine:
         )
         threading.Thread(
             target=self.ws.run_forever,
-            kwargs={
-                "sslopt": {"cert_reqs": ssl.CERT_NONE},
-                "ping_interval": 30,
-                "ping_timeout": 10,
-            },
+            kwargs={"sslopt": {"cert_reqs": ssl.CERT_NONE}},
             daemon=True,
         ).start()
-        if self._watchdog is None or not self._watchdog.is_alive():
-            self._watchdog = threading.Thread(target=self._watchdog_loop, daemon=True)
-            self._watchdog.start()
         return True
 
     def disconnect(self):
@@ -316,34 +325,6 @@ class IQOptionEngine:
         self.log("Disconnected by user.", "warn")
         self.push_state()
 
-    def _watchdog_loop(self):
-        while not self._stop:
-            time.sleep(5)
-            if self._stop:
-                break
-            if not self.is_connected:
-                self.log("Connection lost. Reconnecting in 15s...", "warn")
-                time.sleep(15)
-                if self._stop:
-                    break
-                if self.login():
-                    self.ws = websocket.WebSocketApp(
-                        WS_URL,
-                        on_open=self.on_open,
-                        on_message=self.on_message,
-                        on_error=self.on_error,
-                        on_close=self.on_close,
-                    )
-                    threading.Thread(
-                        target=self.ws.run_forever,
-                        kwargs={
-                            "sslopt": {"cert_reqs": ssl.CERT_NONE},
-                            "ping_interval": 30,
-                            "ping_timeout": 10,
-                        },
-                        daemon=True,
-                    ).start()
-
     # ==================================================================
     # websocket callbacks
     # ==================================================================
@@ -351,6 +332,9 @@ class IQOptionEngine:
         self.is_connected = True
         self.log("WebSocket connected", "success")
 
+        # This handshake and subscription order intentionally mirrors the
+        # supplied reference bot: SSID, balances, then only the strategy's
+        # requested candle timeframes.
         self._send({"name": "ssid", "msg": self.ssid, "request_id": self._next_id()})
         time.sleep(1)
         self._send({
@@ -358,16 +342,11 @@ class IQOptionEngine:
             "msg": {"name": "get-balances", "version": "1.0"},
             "request_id": self._next_id(),
         })
-        self._send({
-            "name": "sendMessage",
-            "msg": {"name": "get-profile", "version": "1.0"},
-            "request_id": self._next_id(),
-        })
-        time.sleep(0.5)
+        time.sleep(1)
         self.subscribed.clear()
-        for tf in set(self.required_timeframes) | {self.chart_timeframe}:
-            self.subscribe_candles(tf)
-        self.request_history(self.chart_timeframe, 200)
+        for timeframe in self.required_timeframes:
+            self.subscribe_candles(timeframe)
+            time.sleep(0.2)
         self.push_state()
 
     def on_error(self, ws, error):
@@ -412,22 +391,6 @@ class IQOptionEngine:
         })
         self.subscribed.discard(size)
 
-    def request_history(self, size: int, count: int = 200):
-        self._send({
-            "name": "sendMessage",
-            "request_id": self._next_id(),
-            "msg": {
-                "name": "get-candles",
-                "version": "2.0",
-                "body": {
-                    "active_id": self.active_id,
-                    "size": int(size),
-                    "to": int(time.time()),
-                    "count": int(count),
-                },
-            },
-        })
-
     def switch_asset(self, active_id: int, active_name: str):
         old = self.active_id
         with self.lock:
@@ -446,9 +409,8 @@ class IQOptionEngine:
                     "request_id": self._next_id(),
                 })
             self.subscribed.clear()
-            for tf in set(self.required_timeframes) | {self.chart_timeframe}:
+            for tf in self.required_timeframes:
                 self.subscribe_candles(tf)
-            self.request_history(self.chart_timeframe, 200)
         if self.runner and hasattr(self.runner.strategy, "reset"):
             try:
                 self.runner.strategy.reset()
@@ -462,9 +424,11 @@ class IQOptionEngine:
         size = int(size)
         self.chart_timeframe = size
         self.candles.setdefault(size, [])
-        if self.is_connected:
-            self.subscribe_candles(size)
-            self.request_history(size, 200)
+        if self.required_timeframes and size not in self.required_timeframes:
+            self.log(
+                f"Chart timeframe {size}s is not subscribed; load a strategy that requests it.",
+                "warn",
+            )
         self.bus.publish("chart_reset", {"active_name": self.active_name})
         self.push_state()
 
@@ -482,29 +446,14 @@ class IQOptionEngine:
                 self._handle_balances(data)
             elif name == "balance-changed":
                 self._handle_balance_changed(data)
-            elif name == "profile":
-                self._handle_profile(data)
             elif name == "candle-generated":
                 self._handle_candle(data)
-            elif name == "candles":
-                self._handle_history(data)
             elif name in ("option", "option-open"):
                 self._handle_open(data)
             elif name in ("option-closed", "portfolio.position-changed", "position-changed"):
                 self._handle_close(data)
         except Exception:
             self.log(f"Handler error on '{name}': {traceback.format_exc(limit=2)}", "error")
-
-    def _handle_profile(self, data):
-        msg = data.get("msg") or {}
-        if isinstance(msg, dict):
-            self.profile = {
-                "user_id": msg.get("user_id") or msg.get("id"),
-                "name": (msg.get("first_name", "") + " " + msg.get("last_name", "")).strip()
-                or msg.get("nickname"),
-                "country": msg.get("country_id"),
-            }
-            self.push_state()
 
     def _handle_balances(self, data):
         target = ACCOUNT_TYPE_IDS.get(self.account_type, 4)
@@ -547,70 +496,60 @@ class IQOptionEngine:
     # ---------------- candles ----------------
     @staticmethod
     def _norm(c: dict) -> dict | None:
-        low = c.get("low", c.get("min"))
-        high = c.get("high", c.get("max"))
+        low = c.get("low")
+        if low is None:
+            low = c.get("min")
+        high = c.get("high")
+        if high is None:
+            high = c.get("max")
         o, cl = c.get("open"), c.get("close")
         ts = c.get("from") or c.get("timestamp") or c.get("at")
         if None in (low, high, o, cl, ts):
             return None
-        if ts > 1e11:
-            ts = ts / 1e9 if ts > 1e15 else ts / 1000.0
-        return {
-            "timestamp": int(ts), "from": int(ts),
-            "open": float(o), "high": float(high),
-            "low": float(low), "close": float(cl),
-            "volume": c.get("volume", 0),
-            "size": c.get("size"),
-        }
-
-    def _handle_history(self, data):
-        msg = data.get("msg") or {}
-        candles = msg.get("candles") or msg.get("data") or []
-        size = self.chart_timeframe
-        out = []
-        for c in candles:
-            n = self._norm(c)
-            if n:
-                n["size"] = size
-                out.append(n)
-        out.sort(key=lambda x: x["timestamp"])
-        if out:
-            self.candles[size] = out[-500:]
-            self.bus.publish("candles_snapshot", {
-                "timeframe": size,
-                "active_name": self.active_name,
-                "candles": self.candles[size],
-                "markers": self.markers[-100:],
-            })
-            self.log(f"Loaded {len(out)} historical {size}s candles")
+        try:
+            ts = float(ts)
+            if ts > 1e11:
+                ts = ts / 1e9 if ts > 1e15 else ts / 1000.0
+            return {
+                "timestamp": int(ts), "from": int(ts),
+                "open": float(o), "high": float(high),
+                "low": float(low), "close": float(cl),
+                "volume": c.get("volume", 0),
+                "size": c.get("size"),
+            }
+        except (TypeError, ValueError):
+            return None
 
     def _handle_candle(self, data):
+        # The reference bot ignores every timeframe that the loaded strategy
+        # did not request. This prevents the chart or another subscriber from
+        # accidentally feeding a second timeframe into the strategy.
         raw = data.get("msg") or {}
         size = raw.get("size")
         try:
             size = int(size)
         except (TypeError, ValueError):
             return
+        if size not in self.required_timeframes:
+            return
+
         candle = self._norm(raw)
         if candle is None:
             return
         candle["size"] = size
 
+        # Keep the same bounded append behavior as the supplied bot.
         store = self.candles.setdefault(size, [])
-        if store and store[-1]["timestamp"] == candle["timestamp"]:
-            store[-1] = candle
-            new_candle = False
-        else:
-            store.append(candle)
-            new_candle = True
-            if len(store) > 500:
-                del store[0:len(store) - 500]
+        store.append(candle)
+        if len(store) > 500:
+            self.candles[size] = store[-500:]
+            store = self.candles[size]
 
         if size == self.chart_timeframe:
             self.bus.publish("candle", {"timeframe": size, "candle": candle})
             self._check_open_trades(candle["close"])
 
-        if size not in self.required_timeframes or not self.runner:
+        if not self.runner:
             return
 
         signal = None
@@ -631,7 +570,7 @@ class IQOptionEngine:
                 self.place_trade(sig, source="auto")
             else:
                 self.log("Auto-trading OFF -> signal not executed.", "warn")
-        elif new_candle:
+        else:
             self.bus.publish("strategy_status", self.runner.status())
 
     # ---------------- trading ----------------
@@ -649,8 +588,13 @@ class IQOptionEngine:
             self.log("Not connected -- cannot place trade.", "error")
             return False
 
-        amount = float(amount or self.amount)
-        expiration = int(expiration or self.expiration)
+        amount = amount if amount is not None else self.amount
+        expiration = expiration if expiration is not None else self.expiration
+        if amount is None or expiration is None or self.max_concurrent_trades is None:
+            self.log("Set trade amount, expiration, and concurrency in Account & Risk first.", "error")
+            return False
+        amount = float(amount)
+        expiration = int(expiration)
 
         with self.lock:
             if self.active_trades_count >= self.max_concurrent_trades:
@@ -664,28 +608,25 @@ class IQOptionEngine:
         req_id = self._next_id()
         expired = int(time.time()) + expiration
 
-        if self.trade_type == "digital":
-            payload = self._digital_payload(direction, amount, expiration, req_id)
-        else:
-            payload = {
-                "name": "sendMessage",
-                "request_id": req_id,
-                "msg": {
-                    "name": "binary-options.open-option",
-                    "version": "2.0",
-                    "body": {
-                        "user_balance_id": self.balance_id,
-                        "active_id": self.active_id,
-                        "option_type_id": OPTION_TYPE_IDS.get(self.trade_type, 3),
-                        "direction": direction,
-                        "expiration_size": expiration,
-                        "expired": expired,
-                        "price": amount,
-                        "profit_percent": 0,
-                        "refund_value": 0,
-                    },
+        payload = {
+            "name": "sendMessage",
+            "request_id": req_id,
+            "msg": {
+                "name": "binary-options.open-option",
+                "version": "2.0",
+                "body": {
+                    "user_balance_id": self.balance_id,
+                    "active_id": self.active_id,
+                    "option_type_id": OPTION_TYPE_ID,
+                    "direction": direction,
+                    "expiration_size": expiration,
+                    "expired": expired,
+                    "price": amount,
+                    "profit_percent": 0,
+                    "refund_value": 0,
                 },
-            }
+            },
+        }
 
         if not self._send(payload):
             with self.lock:
@@ -712,7 +653,6 @@ class IQOptionEngine:
             "status": "open",
             "result": None,
             "profit": 0.0,
-            "trade_type": self.trade_type,
         }
         self.pending_trades[req_id] = trade
         self.open_trades[req_id] = trade
@@ -725,37 +665,11 @@ class IQOptionEngine:
         self.bus.publish("trade_open", trade)
         self.log(
             f"TRADE PLACED {direction.upper()} ${amount} {expiration}s "
-            f"on {self.active_name} ({self.trade_type}) [{source}]",
+            f"on {self.active_name or self.active_id} [{source}]",
             "trade",
         )
         self.push_state()
         return True
-
-    def _digital_payload(self, direction, amount, expiration, req_id):
-        exp_dt = datetime.now(timezone.utc)
-        minutes = max(1, expiration // 60)
-        exp_ts = int(time.time()) + minutes * 60
-        exp_dt = datetime.fromtimestamp(exp_ts, tz=timezone.utc)
-        instrument = (
-            f"do{self.active_id}A"
-            f"{exp_dt.strftime('%Y%m%d%H%M')}"
-            f"{'C' if direction == 'call' else 'P'}SPT"
-        )
-        return {
-            "name": "sendMessage",
-            "request_id": req_id,
-            "msg": {
-                "name": "digital-options.place-digital-option",
-                "version": "2.0",
-                "body": {
-                    "user_balance_id": self.balance_id,
-                    "instrument_id": instrument,
-                    "amount": str(amount),
-                    "asset_id": self.active_id,
-                    "instrument_index": 0,
-                },
-            },
-        }
 
     def _check_open_trades(self, price: float):
         changed = False
@@ -840,28 +754,33 @@ class IQOptionEngine:
         profit_amount = msg.get("profit_amount")
 
         result, profit = None, 0.0
+        payout = win_amount if win_amount is not None else profit_amount
         if win_status == "win":
             result = "WIN"
         elif win_status in ("loose", "loss"):
             result = "LOSS"
         elif win_status in ("equal", "draw"):
             result = "DRAW"
-
-        payout = win_amount if win_amount is not None else profit_amount
-        if payout is not None:
+        elif payout is not None:
             try:
                 p = float(payout)
-                profit = p - amount if result != "LOSS" else -amount
-                if result is None:
-                    result = "WIN" if p > amount else ("DRAW" if p == amount else "LOSS")
-            except Exception:
-                pass
-        if result == "LOSS":
+                result = "WIN" if p > amount else ("DRAW" if p == amount else "LOSS")
+            except (TypeError, ValueError):
+                return
+
+        # Match the reference bot's win_amount/profit_amount handling: a
+        # broker value larger than the stake is a total return, otherwise it
+        # is already treated as the profit value.
+        if result == "WIN":
+            try:
+                p = float(payout) if payout is not None else 0.0
+            except (TypeError, ValueError):
+                p = 0.0
+            profit = p - amount if p > amount else p
+        elif result == "LOSS":
             profit = -amount
         elif result == "DRAW":
             profit = 0.0
-        elif result == "WIN" and profit <= 0:
-            profit = amount * 0.8
 
         trade.update({
             "status": "closed", "result": result or "UNKNOWN",
@@ -896,17 +815,22 @@ class IQOptionEngine:
         self.push_state()
 
     # ---------------- strategy ----------------
-    def load_strategy(self, module_name: str | None = None, source_path: str | None = None,
+    def load_strategy(self, source_path: str | None = None,
                       label: str | None = None):
-        runner = StrategyRunner(module_name=module_name, source_path=source_path)
+        runner = StrategyRunner(source_path=source_path or "")
+        old_timeframes = set(self.required_timeframes)
         self.runner = runner
-        self.strategy_label = label or module_name or "custom"
+        self.strategy_label = label or "custom"
         self.required_timeframes = runner.required_timeframes()
-        for tf in self.required_timeframes:
-            self.candles.setdefault(tf, [])
+        if self.chart_timeframe not in self.required_timeframes:
+            self.chart_timeframe = self.required_timeframes[0]
+        for timeframe in self.required_timeframes:
+            self.candles.setdefault(timeframe, [])
         if self.is_connected:
-            for tf in self.required_timeframes:
-                self.subscribe_candles(tf)
+            for timeframe in old_timeframes - set(self.required_timeframes):
+                self.unsubscribe_candles(timeframe)
+            for timeframe in self.required_timeframes:
+                self.subscribe_candles(timeframe)
         self.log(
             f"Strategy loaded: {self.strategy_label} "
             f"(timeframes {self.required_timeframes})",

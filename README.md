@@ -24,8 +24,8 @@ Account settings ও custom strategies restart-এর পরেও রাখত�
 
 ## Repository layout
 
-- `webapp/` — FastAPI server, live trading engine, backtest runner এবং browser UI
-- `strategies/` — dashboard-এ load করা built-in strategies
+- `webapp/` — FastAPI server, live trading engine, Script Lab, backtest runner এবং browser UI
+- `webapp/user_strategies/` — Script Lab-এ তৈরি user strategies (runtime directory; repository-তে কোনো built-in strategy নেই)
 - `candles_asset_*_30s_30d.csv` / `candles_asset_*_60s_30d.csv` — Backtest tab-এর local datasets
 
 > `settings.json` এবং user strategies runtime-এ `APP_DATA_DIR`-এর অধীনে তৈরি হয়; এগুলো version control-এ রাখা হয় না।

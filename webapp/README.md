@@ -17,7 +17,7 @@ Repository root-এ থাকা [`render.yaml`](../render.yaml) এবং [`req
    | `DASHBOARD_PASSWORD` | **অবশ্যই** | Public Render URL খোলার login password। এটি IQ Option password নয়। |
 
 4. Deploy শেষ হলে service URL খুলুন, `DASHBOARD_PASSWORD` দিয়ে login করুন।
-5. **Account & Risk → IQ Option Credentials**-এ আপনার IQ Option email, password, PRACTICE/REAL mode এবং trade type ইনপুট করে **Save account settings** চাপুন। তারপর sidebar থেকে **Connect** করুন।
+5. **Account & Risk → IQ Option Credentials**-এ আপনার IQ Option email, password, account mode, `ACTIVE_ID`, trade amount এবং expiration নিজে ইনপুট করে **Save** করুন। এখানে কোনো account বা market ID আগে থেকে দেওয়া থাকে না। তারপর Sidebar থেকে **Connect** করুন।
 
 Render health check endpoint হলো `/health`। Start command:
 
@@ -65,11 +65,11 @@ python3 -m venv .venv
 | **Trading** | Asset, stake, expiry select করে manual CALL/PUT; validated strategy দিয়ে auto-trading চালু করা যায়। |
 | **Strategy Lab** | Python strategy edit, validate ও live signal-এর জন্য activate। |
 | **Backtest** | Local CSV dataset-এ fixed stake/payout দিয়ে strategy result, equity curve, hourly stats দেখা যায়। |
-| **Account & Risk** | IQ Option account, practice/real mode, trade type এবং risk guardrails configure। |
+| **Account & Risk** | IQ Option account, account mode, user-supplied `ACTIVE_ID` এবং risk guardrails configure। |
 
 ## Strategy contract
 
-Built-in strategies `strategies/` folder থেকে load হয়। User-created strategy `APP_DATA_DIR/user_strategies/`-এ (default: `webapp/user_strategies/`) save হয়। প্রতিটি strategy-তে `Strategy` class থাকতে হবে:
+কোনো built-in strategy নেই। Script Lab-এ তৈরি ও validate করা strategy `APP_DATA_DIR/user_strategies/`-এ (default: `webapp/user_strategies/`) save হয় এবং সেখান থেকেই live/backtest-এর জন্য load হয়। প্রতিটি strategy-তে `Strategy` class থাকতে হবে:
 
 ```python
 class Strategy:
