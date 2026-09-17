@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IQ Option Bot — Control Center</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<aside class="sidebar">
+  <div class="brand">
+    <div class="logo">IQ</div>
+    <div>
+      <h1>Bot Console</h1>
+      <span id="brandAsset">—</span>
+    </div>
+  </div>
+
+  <nav>
+    <button class="nav-btn active" data-tab="dashboard"><i>▤</i> Dashboard</button>
+    <button class="nav-btn" data-tab="trading"><i>⇅</i> Trading</button>
+    <button class="nav-btn" data-tab="strategy"><i>ƒ</i> Strategy</button>
+    <button class="nav-btn" data-tab="backtest"><i>⟲</i> Backtest</button>
+    <button class="nav-btn" data-tab="account"><i>⚙</i> Account Setup</button>
+  </nav>
+
+  <div class="conn-box">
+    <div class="conn-row">
+      <span class="dot" id="connDot"></span>
+      <span id="connText">Disconnected</span>
+    </div>
+    <button id="btnConnect" class="btn btn-primary full">Connect</button>
+    <button id="btnDisconnect" class="btn btn-ghost full">Disconnect</button>
+  </div>
+</aside>
+
+<main>
+  <!-- ================= DASHBOARD ================= -->
+  <section class="tab active" id="tab-dashboard">
+    <header class="page-head">
+      <h2>Dashboard</h2>
+      <div class="head-actions">
+        <span class="pill" id="pillAuto">AUTO OFF</span>
+        <span class="pill" id="pillAcct">PRACTICE</span>
+        <button class="btn btn-ghost sm" id="btnResetStats">Reset Stats</button>
+      </div>
+    </header>
+
+    <div class="stat-grid">
+      <div class="stat"><label>Balance</label><b id="sBalance">$0.00</b><small id="sAcctType">practice</small></div>
+      <div class="stat"><label>Session P/L</label><b id="sPnl">$0.00</b><small id="sTradesCount">0 trades</small></div>
+      <div class="stat"><label>Win Rate</label><b id="sWr">0%</b><small id="sWl">0W / 0L</small></div>
+      <div class="stat"><label>Open Trades</label><b id="sOpen">0</b><small id="sMax">max 1</small></div>
+      <div class="stat"><label>Strategy</label><b id="sStrat">none</b><small id="sTf">—</small></div>
+      <div class="stat"><label>Account</label><b id="sEmail">—</b><small id="sUid">—</small></div>
+    </div>
+
+    <div class="chart-card">
+      <div class="chart-head">
+        <div>
+          <b id="chartAsset">—</b>
+          <span class="muted" id="chartPrice">—</span>
+        </div>
+        <div class="tf-group" id="tfGroup">
+          <button data-tf="5">5s</button>
+          <button data-tf="10">10s</button>
+          <button data-tf="15">15s</button>
+          <button data-tf="30">30s</button>
+          <button data-tf="60" class="active">1m</button>
+          <button data-tf="300">5m</button>
+        </div>
+      </div>
+      <canvas id="chart"></canvas>
+      <div class="chart-legend">
+        <span><i class="sq up"></i> CALL entry</span>
+        <span><i class="sq down"></i> PUT entry</span>
+        <span><i class="sq win"></i> Win</span>
+        <span><i class="sq loss"></i> Loss</span>
+        <span><i class="sq live"></i> Live candle</span>
+      </div>
+    </div>
+
+    <div class="two-col">
+      <div class="card">
+        <h3>Open Positions</h3>
+        <div class="table-wrap"><table id="openTable">
+          <thead><tr><th>Asset</th><th>Dir</th><th>Stake</th><th>Entry</th><th>Now</th><th>Left</th><th>State</th></tr></thead>
+          <tbody><tr class="empty"><td colspan="7">No open positions</td></tr></tbody>
+        </table></div>
+      </div>
+      <div class="card">
+        <h3>Live Log</h3>
+        <div id="logBox" class="log"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Trade History</h3>
+      <div class="table-wrap"><table id="histTable">
+        <thead><tr><th>#</th><th>Time</th><th>Asset</th><th>Dir</th><th>Stake</th><th>Source</th><th>Result</th><th>P/L</th></tr></thead>
+        <tbody><tr class="empty"><td colspan="8">No trades yet</td></tr></tbody>
+      </table></div>
+    </div>
+  </section>
+
+  <!-- ================= TRADING ================= -->
+  <section class="tab" id="tab-trading">
+    <header class="page-head"><h2>Trading</h2></header>
+    <div class="two-col">
+      <div class="card">
+        <h3>Manual Trade</h3>
+        <label>Currency Pair</label>
+        <select id="tAsset"></select>
+        <div class="row">
+          <div><label>Stake ($)</label><input type="number" id="tAmount" step="0.1" min="1" value="1"></div>
+          <div><label>Expiration</label>
+            <select id="tExp">
+              <option value="30">30 seconds</option>
+              <option value="60" selected>1 minute</option>
+              <option value="120">2 minutes</option>
+              <option value="300">5 minutes</option>
+              <option value="900">15 minutes</option>
+            </select>
+          </div>
+        </div>
+        <div class="row gap">
+          <button class="btn btn-call" id="btnCall">▲ CALL / BUY</button>
+          <button class="btn btn-put" id="btnPut">▼ PUT / SELL</button>
+        </div>
+        <p class="hint">Trades are sent through the same <code>binary-options.open-option</code> WebSocket message the CLI bot uses.</p>
+      </div>
+
+      <div class="card">
+        <h3>Auto Trading</h3>
+        <div class="auto-box">
+          <div>
+            <b id="autoStateText">Disabled</b>
+            <small>Executes every BUY/SELL signal from the loaded strategy.</small>
+          </div>
+          <label class="switch"><input type="checkbox" id="autoToggle"><span></span></label>
+        </div>
+        <label>Active Strategy</label>
+        <select id="tStrategy"></select>
+        <button class="btn btn-ghost full" id="btnLoadStratTrading">Load Strategy</button>
+        <div class="row">
+          <div><label>Max concurrent trades</label><input type="number" id="tMaxConc" min="1" max="10" value="1"></div>
+          <div><label>Trade type</label>
+            <select id="tTradeType">
+              <option value="turbo">Binary / Turbo (&lt;5m)</option>
+              <option value="binary">Binary (classic)</option>
+              <option value="digital">Digital</option>
+            </select>
+          </div>
+        </div>
+        <button class="btn btn-primary full" id="btnApplyTrading">Apply Settings</button>
+        <div class="strat-status" id="stratStatus"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= STRATEGY ================= -->
+  <section class="tab" id="tab-strategy">
+    <header class="page-head">
+      <h2>Strategy</h2>
+      <div class="head-actions">
+        <select id="sSelect" class="inline"></select>
+        <button class="btn btn-ghost sm" id="btnOpenStrat">Open</button>
+        <button class="btn btn-ghost sm" id="btnNewStrat">New</button>
+      </div>
+    </header>
+    <div class="card">
+      <div class="row">
+        <div><label>File name</label><input id="sFilename" placeholder="my_strategy.py"></div>
+        <div class="right-btns">
+          <button class="btn btn-ghost" id="btnSaveStrat">Save &amp; Validate</button>
+          <button class="btn btn-primary" id="btnActivateStrat">Activate for Live</button>
+        </div>
+      </div>
+      <textarea id="sCode" spellcheck="false"></textarea>
+      <div id="sMsg" class="msg"></div>
+      <details class="help">
+        <summary>Strategy contract (what your Python file must implement)</summary>
+        <pre>class Strategy:
+    required_timeframes = [60]        # seconds; bot subscribes to these
+
+    def update_candle(self, timeframe, candle):
+        # candle = {"timestamp","open","high","low","close","volume"}
+        # return "CALL" (buy) / "PUT" (sell) / None
+        return None
+
+    def get_status(self):             # optional, shown in the UI
+        return {"no_trade_reason": "..."}
+
+    def reset(self):                  # optional, called on asset switch
+        pass</pre>
+      </details>
+    </div>
+  </section>
+
+  <!-- ================= BACKTEST ================= -->
+  <section class="tab" id="tab-backtest">
+    <header class="page-head"><h2>Backtest</h2></header>
+    <div class="card">
+      <div class="row4">
+        <div><label>Strategy</label><select id="bStrategy"></select></div>
+        <div><label>Dataset</label><select id="bDataset"></select></div>
+        <div><label>Expiration</label>
+          <select id="bExp"><option value="60" selected>60s</option><option value="120">120s</option><option value="300">300s</option></select>
+        </div>
+        <div><label>Payout %</label><input type="number" id="bPayout" value="80" min="10" max="100"></div>
+      </div>
+      <div class="row4">
+        <div><label>Stake ($)</label><input type="number" id="bStake" value="1" step="0.5"></div>
+        <div><label>From (UTC)</label><input type="date" id="bStart"></div>
+        <div><label>To (UTC)</label><input type="date" id="bEnd"></div>
+        <div class="bottom"><button class="btn btn-primary full" id="btnRunBt">Run Backtest</button></div>
+      </div>
+      <div id="btMsg" class="msg"></div>
+    </div>
+
+    <div id="btResult" class="hidden">
+      <div class="stat-grid">
+        <div class="stat"><label>Trades</label><b id="bTrades">0</b><small id="bRange">—</small></div>
+        <div class="stat"><label>Win Rate</label><b id="bWr">0%</b><small id="bBe">breakeven —</small></div>
+        <div class="stat"><label>Net P/L</label><b id="bPnl">$0</b><small id="bRoi">ROI —</small></div>
+        <div class="stat"><label>Max Drawdown</label><b id="bDd">$0</b><small id="bStreak">—</small></div>
+      </div>
+      <div class="card">
+        <h3>Equity Curve</h3>
+        <canvas id="eqChart"></canvas>
+      </div>
+      <div class="two-col">
+        <div class="card"><h3>Hourly Performance (UTC)</h3>
+          <div class="table-wrap"><table id="hourTable"><thead><tr><th>Hour</th><th>Trades</th><th>W</th><th>L</th><th>Win %</th></tr></thead><tbody></tbody></table></div>
+        </div>
+        <div class="card"><h3>Top No-Trade Reasons</h3>
+          <div class="table-wrap"><table id="reasonTable"><thead><tr><th>Reason</th><th>Count</th></tr></thead><tbody></tbody></table></div>
+        </div>
+      </div>
+      <div class="card"><h3>Trades (last 300)</h3>
+        <div class="table-wrap tall"><table id="btTable"><thead><tr><th>#</th><th>Time</th><th>Dir</th><th>Entry</th><th>Expiry</th><th>Result</th><th>P/L</th><th>Balance</th></tr></thead><tbody></tbody></table></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= ACCOUNT ================= -->
+  <section class="tab" id="tab-account">
+    <header class="page-head"><h2>Account Setup</h2></header>
+    <div class="two-col">
+      <div class="card">
+        <h3>IQ Option Credentials</h3>
+        <label>Email</label><input id="aEmail" type="email" placeholder="you@example.com" autocomplete="username">
+        <label>Password</label><input id="aPassword" type="password" placeholder="••••••••" autocomplete="current-password">
+        <div class="row">
+          <div><label>Account type</label>
+            <select id="aAcctType"><option value="PRACTICE">PRACTICE (demo)</option><option value="REAL">REAL (live money)</option></select>
+          </div>
+          <div><label>Trade type</label>
+            <select id="aTradeType">
+              <option value="turbo">Binary / Turbo</option>
+              <option value="binary">Binary (classic)</option>
+              <option value="digital">Digital</option>
+            </select>
+          </div>
+        </div>
+        <label class="check"><input type="checkbox" id="aRemember" checked> Remember on this machine (webapp/settings.json)</label>
+        <button class="btn btn-primary full" id="btnSaveAccount">Save Account Settings</button>
+        <p class="hint warn">REAL account trades use real money. Test everything on PRACTICE first.</p>
+      </div>
+
+      <div class="card">
+        <h3>Default Trade Parameters</h3>
+        <label>Currency Pair</label><select id="aAsset"></select>
+        <div class="row">
+          <div><label>Stake ($)</label><input type="number" id="aAmount" value="1" step="0.5" min="1"></div>
+          <div><label>Expiration (s)</label><input type="number" id="aExp" value="60" step="30" min="30"></div>
+        </div>
+        <div class="row">
+          <div><label>Max concurrent trades</label><input type="number" id="aMaxConc" value="1" min="1" max="10"></div>
+          <div><label>&nbsp;</label><button class="btn btn-ghost full" id="btnSaveDefaults">Save Defaults</button></div>
+        </div>
+        <div class="kv">
+          <div><span>Connection</span><b id="aConn">—</b></div>
+          <div><span>Balance ID</span><b id="aBalId">—</b></div>
+          <div><span>User ID</span><b id="aUserId">—</b></div>
+          <div><span>Subscribed TFs</span><b id="aTfs">—</b></div>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
