@@ -1,3 +1,6 @@
 __pycache__/
 *.py[cod]
 .env
+.venv/
+webapp/settings.json
+webapp/user_strategies/*.py
