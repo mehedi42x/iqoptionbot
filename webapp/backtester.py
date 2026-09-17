@@ -69,10 +69,12 @@ def _filter_range(candles, start=None, end=None):
     return candles
 
 
-def run(strategy_module=None, strategy_path=None, dataset_path=None,
+def run(strategy_path=None, dataset_path=None,
         expiration=60, payout=0.80, stake=1.0, start=None, end=None,
         timeframe=60, label=None):
-    runner = StrategyRunner(module_name=strategy_module, source_path=strategy_path)
+    if not strategy_path:
+        raise ValueError("Create and save a strategy in Script Lab first.")
+    runner = StrategyRunner(source_path=strategy_path)
     Strategy = runner.module.Strategy
     strat = Strategy()
 
@@ -183,7 +185,7 @@ def run(strategy_module=None, strategy_path=None, dataset_path=None,
                 .strftime("%Y-%m-%d"))
 
     return {
-        "label": label or strategy_module or "custom",
+        "label": label or os.path.splitext(os.path.basename(strategy_path))[0] or "custom",
         "dataset": os.path.basename(dataset_path),
         "range": span,
         "candles": len(candles),

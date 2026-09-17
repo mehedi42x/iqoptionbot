@@ -1,8 +1,12 @@
-# IQ Option Bot
+# IQ Option Bot Web Control Centre
 
-IQ Option binary-options research scripts, strategies, historical backtests এবং একটি FastAPI ভিত্তিক **Web Control Centre**।
+FastAPI ভিত্তিক IQ Option trading dashboard। ব্রাউজার থেকে account setup, live candles, manual/automatic trading, strategy management এবং local candle-data backtest চালানো যায়। Broker credentials server-side engine-এ থাকে; browser সরাসরি IQ Option-এর সঙ্গে যোগাযোগ করে না।
 
-## Web dashboard চালান
+> **Risk notice:** Binary/digital options উচ্চ-ঝুঁকির। প্রথমে **PRACTICE** account ও backtest দিয়ে যাচাই করুন। REAL mode-এ order দিলে বাস্তব টাকা ব্যবহার হবে।
+
+## Local run
+
+Python 3.11 ব্যবহার করার পরামর্শ দেওয়া হচ্ছে:
 
 ```bash
 python3 -m venv .venv
@@ -10,18 +14,18 @@ python3 -m venv .venv
 .venv/bin/uvicorn webapp.server:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-তারপর `http://localhost:8000` খুলুন। IQ Option email, password, PRACTICE/REAL mode এবং trade settings dashboard-এর **Account & Risk** page থেকে ইনপুট করুন—`.env` বা `IQOPTION_*` environment variable দরকার নেই।
+তারপর `http://localhost:8000` খুলুন। Local development-এ `DASHBOARD_PASSWORD` unset থাকলে login gateway দেখাবে না; public deployment-এ এটি অবশ্যই সেট করুন।
 
 ## Render deploy
 
-এই repo-তে Render Blueprint-এর জন্য `render.yaml`, production `requirements.txt`, `Procfile`, `.python-version`, health endpoint এবং password-protected dashboard login যোগ করা আছে।
+Repository-র `render.yaml`, `Procfile`, `.python-version` এবং `requirements.txt` Render web service-এর জন্য প্রস্তুত। Render-এ Blueprint হিসেবে repository connect করুন এবং `DASHBOARD_PASSWORD` secret দিন। Deploy হওয়ার পরে `/health` endpoint দিয়ে service health দেখা যাবে।
 
-1. Render-এ **New → Blueprint** নির্বাচন করুন এবং repository connect করুন।
-2. শুধু `DASHBOARD_PASSWORD` secret দিন—এটি public dashboard access lock করে, এটি IQ Option password নয়।
-3. Deploy হওয়ার পরে dashboard-এ login করে **Account & Risk** থেকে IQ Option account setup করুন।
-4. Account settings restart-এর পরও রাখতে Render Persistent Disk attach করে `APP_DATA_DIR=/var/data` দিন।
-5. Deploy-এর পরে `/health` endpoint দিয়ে service health দেখুন।
+Account settings ও custom strategies restart-এর পরেও রাখতে চাইলে Persistent Disk mount করে `APP_DATA_DIR=/var/data` দিন। সম্পূর্ণ deployment, storage, security notes এবং strategy contract-এর জন্য [`webapp/README.md`](webapp/README.md) দেখুন।
 
-সম্পূর্ণ Render setup, storage, security notes ও strategy contract: **[webapp/README.md](webapp/README.md)**
+## Repository layout
 
-> **Risk notice:** REAL IQ Option account ব্যবহার করলে বাস্তব টাকা ঝুঁকিতে পড়ে। PRACTICE mode ও backtest দিয়ে আগে যাচাই করুন।
+- `webapp/` — FastAPI server, live trading engine, Script Lab, backtest runner এবং browser UI
+- `webapp/user_strategies/` — Script Lab-এ তৈরি user strategies (runtime directory; repository-তে কোনো built-in strategy নেই)
+- `candles_asset_*_30s_30d.csv` / `candles_asset_*_60s_30d.csv` — Backtest tab-এর local datasets
+
+> `settings.json` এবং user strategies runtime-এ `APP_DATA_DIR`-এর অধীনে তৈরি হয়; এগুলো version control-এ রাখা হয় না।

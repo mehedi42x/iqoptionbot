@@ -24,7 +24,6 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import assets as assets_mod
 from . import backtester
 from .engine import EventBus, IQOptionEngine, StrategyRunner
 
@@ -165,7 +164,7 @@ def health():
 # Settings persistence (opt-in, local filesystem only)
 # ----------------------------------------------------------------------
 PERSISTED_SETTING_KEYS = {
-    "email", "password", "account_type", "trade_type", "active_id", "active_name",
+    "email", "password", "account_type", "active_id", "active_name",
     "amount", "expiration", "max_concurrent_trades",
 }
 
@@ -238,12 +237,12 @@ class AccountIn(BaseModel):
     email: str | None = Field(default=None, max_length=320)
     password: str | None = Field(default=None, max_length=512)
     account_type: str | None = None
-    trade_type: str | None = None
-    active_id: int | None = None
+    active_id: int | None = Field(default=None, gt=0)
+    active_name: str | None = Field(default=None, max_length=100)
     amount: float | None = Field(default=None, gt=0, le=1_000_000)
     expiration: int | None = Field(default=None, ge=5, le=86_400)
     max_concurrent_trades: int | None = Field(default=None, ge=1, le=10)
-    remember: bool = True
+    remember: bool = False
 
 
 class TradeIn(BaseModel):
@@ -253,7 +252,8 @@ class TradeIn(BaseModel):
 
 
 class AssetIn(BaseModel):
-    active_id: int
+    active_id: int = Field(gt=0)
+    active_name: str | None = Field(default=None, max_length=100)
 
 
 class TFIn(BaseModel):
@@ -273,9 +273,9 @@ class StrategyIn(BaseModel):
 class BacktestIn(BaseModel):
     strategy: str = Field(min_length=1, max_length=100)
     dataset: str = Field(min_length=1, max_length=255)
-    expiration: int = Field(default=60, ge=5, le=86_400)
-    payout: float = Field(default=0.80, gt=0, le=1)
-    stake: float = Field(default=1.0, gt=0, le=1_000_000)
+    expiration: int = Field(ge=5, le=86_400)
+    payout: float = Field(gt=0, le=1)
+    stake: float = Field(gt=0, le=1_000_000)
     start: str | None = None
     end: str | None = None
 
@@ -295,23 +295,20 @@ def _assert_account_values(data: dict[str, Any]) -> None:
         data["account_type"] = str(data["account_type"]).upper()
         if data["account_type"] not in {"PRACTICE", "REAL"}:
             raise HTTPException(status_code=422, detail="Account type must be PRACTICE or REAL.")
-    if "trade_type" in data:
-        data["trade_type"] = str(data["trade_type"]).lower()
-        if data["trade_type"] not in {"turbo", "binary", "digital"}:
-            raise HTTPException(status_code=422, detail="Unsupported trade type.")
-    if "active_id" in data and int(data["active_id"]) not in assets_mod.BY_ID:
-        raise HTTPException(status_code=422, detail="Unknown asset.")
+    if "active_id" in data and int(data["active_id"]) <= 0:
+        raise HTTPException(status_code=422, detail="ACTIVE_ID must be a positive integer.")
+    if "active_name" in data and data["active_name"] is not None:
+        data["active_name"] = str(data["active_name"]).strip()
 
 
 def _strategy_path(strategy_id: str) -> Path | None:
-    if strategy_id.startswith("user:"):
-        filename = strategy_id[5:]
-        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,79}\.py", filename):
-            return None
-        return USER_STRATS / filename
-    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,79}", strategy_id):
+    """Resolve only Script Lab strategies; the application ships none."""
+    if not strategy_id.startswith("user:"):
         return None
-    return ROOT / "strategies" / f"{strategy_id}.py"
+    filename = strategy_id[5:]
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,79}\.py", filename):
+        return None
+    return USER_STRATS / filename
 
 
 def _require_strategy(strategy_id: str) -> Path:
@@ -329,18 +326,11 @@ def get_state():
     return {**engine.snapshot(), "auth_enabled": _auth_required(), "storage_path": str(DATA_DIR)}
 
 
-@app.get("/api/assets")
-def get_assets():
-    return assets_mod.ASSETS
-
-
 @app.post("/api/account")
 def set_account(body: AccountIn):
     data = _model_data(body)
     remember = data.pop("remember", True)
     _assert_account_values(data)
-    if "active_id" in data:
-        data["active_name"] = assets_mod.name_for(data["active_id"])
     engine.configure(**data)
     if data.get("account_type"):
         engine.switch_balance(data["account_type"])
@@ -372,9 +362,7 @@ def disconnect():
 
 @app.post("/api/asset")
 def set_asset(body: AssetIn):
-    if body.active_id not in assets_mod.BY_ID:
-        raise HTTPException(status_code=404, detail="Asset not found.")
-    engine.switch_asset(body.active_id, assets_mod.name_for(body.active_id))
+    engine.switch_asset(body.active_id, body.active_name or "")
     return {"ok": True}
 
 
@@ -410,14 +398,11 @@ def reset_stats():
 
 @app.get("/api/strategies")
 def list_strategies():
+    """Return only strategies created through Script Lab."""
     out = []
-    builtin_dir = ROOT / "strategies"
-    for path in sorted(builtin_dir.glob("*.py")):
-        if not path.name.startswith("__"):
-            out.append({"id": path.stem, "name": path.stem.replace("_", " ").title(), "builtin": True})
     for path in sorted(USER_STRATS.glob("*.py")):
         if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,79}\.py", path.name):
-            out.append({"id": f"user:{path.name}", "name": path.stem.replace("_", " ").title(), "builtin": False})
+            out.append({"id": f"user:{path.name}", "name": path.stem.replace("_", " ").title()})
     return out
 
 
@@ -474,10 +459,7 @@ def load_strategy(body: StrategyIn):
         raise HTTPException(status_code=400, detail="Strategy name is required.")
     try:
         path = _require_strategy(body.name)
-        if body.name.startswith("user:"):
-            timeframes = engine.load_strategy(source_path=str(path), label=path.stem)
-        else:
-            timeframes = engine.load_strategy(module_name=path.stem, label=path.stem)
+        timeframes = engine.load_strategy(source_path=str(path), label=path.stem)
         return {"ok": True, "timeframes": timeframes}
     except HTTPException:
         raise
@@ -511,9 +493,7 @@ def run_backtest(body: BacktestIn):
             stake=body.stake, start=body.start, end=body.end, timeframe=timeframe,
             label=strategy_path.stem,
         )
-        if body.strategy.startswith("user:"):
-            return backtester.run(strategy_path=str(strategy_path), **options)
-        return backtester.run(strategy_module=strategy_path.stem, **options)
+        return backtester.run(strategy_path=str(strategy_path), **options)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:

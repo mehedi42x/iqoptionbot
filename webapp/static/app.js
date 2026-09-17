@@ -69,7 +69,6 @@ function setMessage(selector, text, kind = '') {
 let STATE = {};
 let CANDLES = [];
 let MARKERS = [];
-let ASSETS = [];
 let EQUITY = [];
 let socket;
 let socketRetry;
@@ -244,12 +243,15 @@ function renderState(state) {
   $('#connDot').className = `dot${connected ? ' on' : ''}`;
   $('#mobileConnDot').className = `dot${connected ? ' on' : ''}`;
   $('#connText').textContent = connected ? 'Connected' : 'Disconnected';
-  $('#brandAsset').textContent = STATE.active_name || 'EURUSD';
-  $('#mobileAsset').textContent = STATE.active_name || 'EURUSD';
-  $('#chartAsset').textContent = STATE.active_name || 'EURUSD';
+  const marketLabel = STATE.active_name || (STATE.active_id ? `ACTIVE_ID ${STATE.active_id}` : 'No market selected');
+  $('#brandAsset').textContent = marketLabel;
+  $('#mobileAsset').textContent = marketLabel;
+  $('#chartAsset').textContent = marketLabel;
 
   $('#sBalance').textContent = `${money(STATE.balance)} ${STATE.currency || ''}`.trim();
-  $('#sAcctType').textContent = `${String(STATE.account_type || 'practice').toLowerCase()} account`;
+  $('#sAcctType').textContent = STATE.account_type
+    ? `${String(STATE.account_type).toLowerCase()} account`
+    : 'Account not configured';
   const pnl = number(STATE.pnl);
   $('#sPnl').textContent = money(pnl);
   $('#sPnl').className = pnl > 0 ? 'g' : (pnl < 0 ? 'r' : '');
@@ -257,7 +259,9 @@ function renderState(state) {
   $('#sWr').textContent = `${number(STATE.winrate).toFixed(2).replace(/\.00$/, '')}%`;
   $('#sWl').textContent = `${number(STATE.wins)}W / ${number(STATE.losses)}L / ${number(STATE.draws)}D`;
   $('#sOpen').textContent = number(STATE.active_trades);
-  $('#sMax').textContent = `max ${number(STATE.max_concurrent_trades, 1)} concurrent`;
+  $('#sMax').textContent = STATE.max_concurrent_trades
+    ? `max ${number(STATE.max_concurrent_trades)} concurrent`
+    : 'Trade limit not set';
   $('#sStrat').textContent = STATE.strategy || 'None';
   $('#sTf').textContent = (STATE.timeframes || []).length ? (STATE.timeframes || []).map((timeframe) => `${timeframe}s`).join(' · ') : 'Select a strategy to start';
   $('#sEmail').textContent = STATE.email ? String(STATE.email).split('@')[0] : '—';
@@ -267,8 +271,8 @@ function renderState(state) {
   autoPill.innerHTML = `<span class="pill-dot"></span>${STATE.auto_trading ? 'AUTO ON' : 'AUTO OFF'}`;
   autoPill.className = `pill${STATE.auto_trading ? ' on' : ''}`;
   const accountPill = $('#pillAcct');
-  accountPill.textContent = STATE.account_type || 'PRACTICE';
-  accountPill.className = `pill ${STATE.account_type === 'REAL' ? 'real' : 'pill-practice'}`;
+  accountPill.textContent = STATE.account_type || 'ACCOUNT NOT SET';
+  accountPill.className = `pill${STATE.account_type === 'REAL' ? ' real' : (STATE.account_type ? ' pill-practice' : '')}`;
 
   $('#autoToggle').checked = Boolean(STATE.auto_trading);
   $('#autoStateText').textContent = STATE.auto_trading ? 'Enabled — strategy may execute trades' : 'Disabled';
@@ -284,7 +288,7 @@ function renderState(state) {
   if (noticeText) {
     noticeText.innerHTML = connected
       ? '<strong>Live connection active.</strong> Candles and account events are now streaming to this workspace.'
-      : '<strong>Ready when you are.</strong> Connect your IQ Option practice account to begin streaming live candles.';
+      : '<strong>Ready when you are.</strong> Complete Account &amp; Risk and Script Lab setup to begin streaming live candles.';
   }
 
   const status = STATE.strategy_status || {};
@@ -412,12 +416,6 @@ function connectStream() {
 /* ------------------------------------------------------------------ */
 /* Initial data                                                        */
 /* ------------------------------------------------------------------ */
-function optionMarkup(list) {
-  const groups = {};
-  list.forEach((asset) => { (groups[asset.group] ||= []).push(asset); });
-  return Object.entries(groups).map(([group, assets]) => `<optgroup label="${escapeHtml(group)}">${assets.map((asset) => `<option value="${number(asset.id)}">${escapeHtml(asset.name)}</option>`).join('')}</optgroup>`).join('');
-}
-
 function setSelectValue(selector, value) {
   const element = $(selector);
   const desired = String(value ?? '');
@@ -426,7 +424,7 @@ function setSelectValue(selector, value) {
 
 async function loadStrategies() {
   const list = await api('/api/strategies');
-  const markup = list.map((strategy) => `<option value="${escapeHtml(strategy.id)}">${escapeHtml(strategy.name)}${strategy.builtin ? '' : ' · Custom'}</option>`).join('');
+  const markup = list.map((strategy) => `<option value="${escapeHtml(strategy.id)}">${escapeHtml(strategy.name)} · Script Lab</option>`).join('');
   ['#tStrategy', '#sSelect', '#bStrategy'].forEach((selector) => {
     const select = $(selector);
     const current = select.value;
@@ -448,25 +446,20 @@ async function loadDatasets() {
 
 async function boot() {
   try {
-    ASSETS = await api('/api/assets');
-    const options = optionMarkup(ASSETS);
-    $('#tAsset').innerHTML = options;
-    $('#aAsset').innerHTML = options;
-
     const state = await api('/api/state');
     renderState(state);
     $('#aEmail').value = state.email || '';
-    setSelectValue('#aAcctType', state.account_type || 'PRACTICE');
-    setSelectValue('#aTradeType', state.trade_type || 'turbo');
-    setSelectValue('#tTradeType', state.trade_type || 'turbo');
-    setSelectValue('#aAsset', state.active_id);
-    setSelectValue('#tAsset', state.active_id);
-    $('#aAmount').value = number(state.amount, 1);
-    $('#tAmount').value = number(state.amount, 1);
-    $('#aExp').value = number(state.expiration, 60);
-    setSelectValue('#tExp', state.expiration);
-    $('#aMaxConc').value = number(state.max_concurrent_trades, 1);
-    $('#tMaxConc').value = number(state.max_concurrent_trades, 1);
+    setSelectValue('#aAcctType', state.account_type || '');
+    $('#aActiveId').value = state.active_id ?? '';
+    $('#aActiveName').value = state.active_name || '';
+    $('#tActiveId').value = state.active_id ?? '';
+    $('#tActiveName').value = state.active_name || '';
+    $('#aAmount').value = state.amount ?? '';
+    $('#tAmount').value = state.amount ?? '';
+    $('#aExp').value = state.expiration ?? '';
+    $('#tExp').value = state.expiration ?? '';
+    $('#aMaxConc').value = state.max_concurrent_trades ?? '';
+    $('#tMaxConc').value = state.max_concurrent_trades ?? '';
 
     await Promise.all([loadStrategies(), loadDatasets()]);
     connectStream();
@@ -516,16 +509,20 @@ $('#tfGroup').addEventListener('click', async (event) => {
   catch (error) { showToast(error.message, 'error'); }
 });
 
-async function selectAsset(activeId) {
+async function selectAsset(activeId, activeName) {
+  const id = number(activeId, 0);
+  if (id <= 0) { showToast('Enter a positive ACTIVE_ID first.', 'warning'); return; }
   try {
-    await api('/api/asset', { active_id: number(activeId) });
-    setSelectValue('#tAsset', activeId);
-    setSelectValue('#aAsset', activeId);
-    showToast('Market changed. Loading fresh chart data.', 'success');
+    await api('/api/asset', { active_id: id, active_name: String(activeName || '').trim() });
+    $('#tActiveId').value = id;
+    $('#aActiveId').value = id;
+    $('#tActiveName').value = activeName || '';
+    $('#aActiveName').value = activeName || '';
+    showToast('Market changed. Waiting for fresh strategy candles.', 'success');
   } catch (error) { showToast(error.message, 'error'); }
 }
-$('#tAsset').addEventListener('change', (event) => selectAsset(event.target.value));
-$('#aAsset').addEventListener('change', (event) => selectAsset(event.target.value));
+$$('#tActiveId, #tActiveName').forEach((element) => element.addEventListener('change', () => selectAsset($('#tActiveId').value, $('#tActiveName').value)));
+$$('#aActiveId, #aActiveName').forEach((element) => element.addEventListener('change', () => selectAsset($('#aActiveId').value, $('#aActiveName').value)));
 
 async function placeTrade(direction) {
   const amount = number($('#tAmount').value, 0);
@@ -568,12 +565,13 @@ $('#btnLoadStratTrading').addEventListener('click', async () => {
 $('#btnApplyTrading').addEventListener('click', async () => {
   try {
     await api('/api/account', {
-      max_concurrent_trades: number($('#tMaxConc').value),
-      trade_type: $('#tTradeType').value,
       amount: number($('#tAmount').value),
       expiration: number($('#tExp').value),
+      max_concurrent_trades: number($('#tMaxConc').value),
+      active_id: number($('#tActiveId').value),
+      active_name: $('#tActiveName').value.trim(),
+      remember: $('#aRemember').checked,
     });
-    setSelectValue('#aTradeType', $('#tTradeType').value);
     $('#aAmount').value = $('#tAmount').value;
     $('#aExp').value = $('#tExp').value;
     $('#aMaxConc').value = $('#tMaxConc').value;
@@ -594,9 +592,9 @@ $('#btnOpenStrat').addEventListener('click', async () => {
 });
 
 $('#btnNewStrat').addEventListener('click', () => {
-  $('#sFilename').value = 'my_strategy.py';
-  $('#sCode').value = TEMPLATE;
-  setMessage('#sMsg', 'New strategy template ready. Edit it and save to validate.', 'ok');
+  $('#sFilename').value = '';
+  $('#sCode').value = '';
+  setMessage('#sMsg', 'Blank editor ready. Write a Strategy class, save it, then activate it.', 'ok');
 });
 
 async function saveEditorStrategy() {
@@ -629,14 +627,12 @@ $('#btnSaveAccount').addEventListener('click', async () => {
   const body = {
     email: $('#aEmail').value.trim(),
     account_type: $('#aAcctType').value,
-    trade_type: $('#aTradeType').value,
     remember: $('#aRemember').checked,
   };
   if ($('#aPassword').value) body.password = $('#aPassword').value;
   try {
     await api('/api/account', body);
     $('#aPassword').value = '';
-    setSelectValue('#tTradeType', body.trade_type);
     showToast(body.remember ? 'Account settings saved.' : 'Account settings applied for this session only.', 'success');
   } catch (error) { showToast(error.message, 'error'); }
 });
@@ -644,16 +640,19 @@ $('#btnSaveAccount').addEventListener('click', async () => {
 $('#btnSaveDefaults').addEventListener('click', async () => {
   try {
     await api('/api/account', {
-      active_id: number($('#aAsset').value),
+      active_id: number($('#aActiveId').value),
+      active_name: $('#aActiveName').value.trim(),
       amount: number($('#aAmount').value),
       expiration: number($('#aExp').value),
       max_concurrent_trades: number($('#aMaxConc').value),
       remember: $('#aRemember').checked,
     });
+    $('#tActiveId').value = $('#aActiveId').value;
+    $('#tActiveName').value = $('#aActiveName').value;
     $('#tAmount').value = $('#aAmount').value;
-    setSelectValue('#tExp', $('#aExp').value);
+    $('#tExp').value = $('#aExp').value;
     $('#tMaxConc').value = $('#aMaxConc').value;
-    showToast('Default trade parameters saved.', 'success');
+    showToast('Trade settings saved.', 'success');
   } catch (error) { showToast(error.message, 'error'); }
 });
 
@@ -749,82 +748,6 @@ function drawEquity() {
 
 window.addEventListener('resize', () => { drawChart(); drawEquity(); });
 
-const TEMPLATE = `"""Custom binary-options strategy.
 
-Return "CALL" to buy or "PUT" to sell. Return None when there is no trade.
-The engine calls update_candle for every required timeframe.
-"""
-
-
-class Strategy:
-    required_timeframes = [60]
-
-    EMA_FAST = 5
-    EMA_SLOW = 20
-
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.candles = []
-        self.last_ts = None
-        self.no_trade_reason = "WARMUP"
-        self.last_signal = None
-
-    @staticmethod
-    def _ema(values, period):
-        if len(values) < period:
-            return None
-        ema = sum(values[:period]) / period
-        k = 2.0 / (period + 1.0)
-        for value in values[period:]:
-            ema = value * k + ema * (1 - k)
-        return ema
-
-    def update_candle(self, timeframe, candle):
-        if int(timeframe) != 60:
-            return None
-
-        timestamp = candle.get("timestamp") or candle.get("from")
-        is_new_candle = timestamp != self.last_ts
-        if is_new_candle:
-            self.last_ts = timestamp
-            self.candles.append(candle)
-            self.candles = self.candles[-300:]
-        elif self.candles:
-            self.candles[-1] = candle
-
-        # Act only when a fresh candle arrives; the previous one is closed.
-        if not is_new_candle or len(self.candles) < self.EMA_SLOW + 2:
-            self.no_trade_reason = "WARMUP"
-            return None
-
-        closes = [item["close"] for item in self.candles[:-1]]
-        fast = self._ema(closes, self.EMA_FAST)
-        slow = self._ema(closes, self.EMA_SLOW)
-        previous_fast = self._ema(closes[:-1], self.EMA_FAST)
-        previous_slow = self._ema(closes[:-1], self.EMA_SLOW)
-        if None in (fast, slow, previous_fast, previous_slow):
-            self.no_trade_reason = "EMA_NOT_READY"
-            return None
-        if previous_fast <= previous_slow and fast > slow:
-            self.no_trade_reason = None
-            self.last_signal = "CALL"
-            return "CALL"
-        if previous_fast >= previous_slow and fast < slow:
-            self.no_trade_reason = None
-            self.last_signal = "PUT"
-            return "PUT"
-
-        self.no_trade_reason = "NO_CROSS"
-        return None
-
-    def get_status(self):
-        return {
-            "candles": len(self.candles),
-            "no_trade_reason": self.no_trade_reason,
-            "last_signal": self.last_signal,
-        }
-`;
 
 boot();
