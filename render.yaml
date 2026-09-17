@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: iq-option-bot
+    runtime: python
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    startCommand: uvicorn webapp.server:app --host 0.0.0.0 --port $PORT --proxy-headers
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      # Do not deploy a public trade console. Add this secret in Render before use.
+      - key: REQUIRE_DASHBOARD_PASSWORD
+        value: "true"
+      - key: DASHBOARD_PASSWORD
+        sync: false

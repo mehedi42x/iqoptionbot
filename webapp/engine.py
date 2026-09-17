@@ -773,18 +773,41 @@ class IQOptionEngine:
         if changed:
             self.bus.publish("trades_tick", {"open": list(self.open_trades.values())})
 
+    def _reject_trade(self, request_id: str, message: str):
+        """Remove a rejected pending order so the UI/concurrency count cannot stick."""
+        trade = self.pending_trades.pop(request_id, None)
+        if not trade:
+            return
+        self.open_trades.pop(request_id, None)
+        if trade.get("option_id") is not None:
+            self.open_trades.pop(str(trade["option_id"]), None)
+        with self.lock:
+            self.active_trades_count = max(0, self.active_trades_count - 1)
+        self.log(f"Trade rejected: {message or 'Unknown error'}", "error")
+        self.push_state()
+
     def _handle_open(self, data):
         msg = data.get("msg") or {}
         rid = str(data.get("request_id") or "")
         trade = self.pending_trades.get(rid)
         if not trade:
             return
+        if msg.get("is_successful") is False:
+            self._reject_trade(rid, str(msg.get("message") or "Unknown error"))
+            return
+
         opt_id = msg.get("id") or (msg.get("option") or {}).get("id")
         if opt_id:
             trade["option_id"] = opt_id
+            # A broker option id replaces the temporary request id. Keeping
+            # both keys rendered the same live position twice in the browser.
+            self.open_trades.pop(rid, None)
             self.open_trades[str(opt_id)] = trade
-        if msg.get("value"):
-            trade["entry_price"] = float(msg["value"])
+        if msg.get("value") is not None:
+            try:
+                trade["entry_price"] = float(msg["value"])
+            except (TypeError, ValueError):
+                pass
         self.bus.publish("trade_open", trade)
 
     def _handle_close(self, data):
@@ -793,10 +816,10 @@ class IQOptionEngine:
             return
 
         if msg.get("is_successful") is False:
-            with self.lock:
-                self.active_trades_count = max(0, self.active_trades_count - 1)
-            self.log(f"Trade rejected: {msg.get('message', 'Unknown error')}", "error")
-            self.push_state()
+            rid = str(data.get("request_id") or "")
+            if not rid:
+                rid = str(msg.get("request_id") or "")
+            self._reject_trade(rid, str(msg.get("message") or "Unknown error"))
             return
 
         opt_id = str(msg.get("id") or msg.get("option_id") or "")
