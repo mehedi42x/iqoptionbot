@@ -1,92 +1,255 @@
+"""FastAPI application for the IQ Option Bot control centre.
+
+The dashboard is intentionally same-origin: the browser only ever talks to this
+process, while IQ Option credentials and WebSocket traffic stay on the server.
+Set ``DASHBOARD_PASSWORD`` in production to protect this trading console.
+"""
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import os
+import re
+import secrets
+import tempfile
+import threading
 import time
 import traceback
+from pathlib import Path
+from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from . import assets as assets_mod
 from . import backtester
-from .engine import EventBus, IQOptionEngine
+from .engine import EventBus, IQOptionEngine, StrategyRunner
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
-USER_STRATS = os.path.join(ROOT, "webapp", "user_strategies")
-SETTINGS_FILE = os.path.join(ROOT, "webapp", "settings.json")
-os.makedirs(USER_STRATS, exist_ok=True)
+ROOT = Path(__file__).resolve().parent.parent
+STATIC = Path(__file__).resolve().parent / "static"
+DATA_DIR = Path(os.getenv("APP_DATA_DIR", str(ROOT / "webapp"))).expanduser()
+USER_STRATS = DATA_DIR / "user_strategies"
+SETTINGS_FILE = DATA_DIR / "settings.json"
+USER_STRATS.mkdir(parents=True, exist_ok=True)
+
+SESSION_COOKIE = "iqbot_dashboard_session"
+SESSION_TTL_SECONDS = max(300, int(os.getenv("DASHBOARD_SESSION_TTL", "28800")))
+_sessions: dict[str, float] = {}
+_sessions_lock = threading.Lock()
 
 bus = EventBus()
 engine = IQOptionEngine(bus)
-app = FastAPI(title="IQ Option Bot Dashboard")
+app = FastAPI(title="IQ Option Bot Dashboard", docs_url=None, redoc_url=None)
 
 
 # ----------------------------------------------------------------------
-# settings persistence (password is stored locally only, opt-in)
+# Deployment security
 # ----------------------------------------------------------------------
-def load_settings() -> dict:
-    if os.path.exists(SETTINGS_FILE):
-        try:
-            with open(SETTINGS_FILE) as f:
-                return json.load(f)
-        except Exception:
+def _dashboard_password() -> str:
+    return os.getenv("DASHBOARD_PASSWORD", "").strip()
+
+
+def _auth_required() -> bool:
+    # Render blueprint sets REQUIRE_DASHBOARD_PASSWORD=true, so an omitted
+    # secret fails closed instead of accidentally publishing trade controls.
+    force_auth = os.getenv("REQUIRE_DASHBOARD_PASSWORD", "").strip().lower()
+    return bool(_dashboard_password()) or force_auth in {"1", "true", "yes", "on"}
+
+
+def _is_valid_session(token: str | None) -> bool:
+    if not _auth_required():
+        return True
+    if not token:
+        return False
+    now = time.time()
+    with _sessions_lock:
+        # Prune expired entries while we are already holding the lock.
+        for key, expiry in list(_sessions.items()):
+            if expiry <= now:
+                _sessions.pop(key, None)
+        return _sessions.get(token, 0) > now
+
+
+def _create_session() -> str:
+    token = secrets.token_urlsafe(32)
+    with _sessions_lock:
+        _sessions[token] = time.time() + SESSION_TTL_SECONDS
+    return token
+
+
+def _forget_session(token: str | None) -> None:
+    if token:
+        with _sessions_lock:
+            _sessions.pop(token, None)
+
+
+def _is_https(request: Request) -> bool:
+    return request.headers.get("x-forwarded-proto", request.url.scheme).split(",")[0] == "https"
+
+
+@app.middleware("http")
+async def dashboard_security(request: Request, call_next):
+    """Require a password-backed session for app and API routes when enabled."""
+    path = request.url.path
+    public_paths = {"/health", "/login", "/api/session", "/api/session/logout"}
+    is_public = path in public_paths or path.startswith("/static/")
+
+    if _auth_required() and not is_public and not _is_valid_session(request.cookies.get(SESSION_COOKIE)):
+        if path.startswith("/api/"):
+            response = JSONResponse({"error": "Dashboard session expired. Please sign in again."}, status_code=401)
+        else:
+            response = RedirectResponse("/login", status_code=303)
+    else:
+        response = await call_next(request)
+
+    # These headers are safe for a same-origin dashboard and reduce accidental
+    # embedding/cross-origin execution when the Render URL is shared.
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    response.headers.setdefault("Cache-Control", "no-store")
+    return response
+
+
+class SessionIn(BaseModel):
+    password: str = Field(min_length=1, max_length=512)
+
+
+@app.get("/login")
+def login_page(request: Request):
+    if not _auth_required():
+        return RedirectResponse("/", status_code=303)
+    if _is_valid_session(request.cookies.get(SESSION_COOKIE)):
+        return RedirectResponse("/", status_code=303)
+    return FileResponse(STATIC / "login.html")
+
+
+@app.post("/api/session")
+def create_session(body: SessionIn, request: Request, response: Response):
+    password = _dashboard_password()
+    if not password:
+        raise HTTPException(status_code=503, detail="Dashboard password is required but has not been configured by the service owner.")
+    if not hmac.compare_digest(body.password, password):
+        raise HTTPException(status_code=401, detail="Incorrect access password.")
+
+    token = _create_session()
+    response.set_cookie(
+        SESSION_COOKIE,
+        token,
+        max_age=SESSION_TTL_SECONDS,
+        httponly=True,
+        secure=_is_https(request),
+        samesite="lax",
+        path="/",
+    )
+    return {"ok": True, "expires_in": SESSION_TTL_SECONDS}
+
+
+@app.post("/api/session/logout")
+def destroy_session(request: Request, response: Response):
+    _forget_session(request.cookies.get(SESSION_COOKIE))
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return {"ok": True}
+
+
+@app.get("/health")
+def health():
+    """Unauthenticated health check for Render."""
+    return {"ok": True, "service": "iq-option-bot", "connected": engine.is_connected}
+
+
+# ----------------------------------------------------------------------
+# Settings persistence (opt-in, local filesystem only)
+# ----------------------------------------------------------------------
+PERSISTED_SETTING_KEYS = {
+    "email", "password", "account_type", "trade_type", "active_id", "active_name",
+    "amount", "expiration", "max_concurrent_trades",
+}
+
+
+def load_settings() -> dict[str, Any]:
+    if not SETTINGS_FILE.exists():
+        return {}
+    try:
+        with SETTINGS_FILE.open(encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
             return {}
-    return {}
+        return {key: raw[key] for key in PERSISTED_SETTING_KEYS if key in raw}
+    except (OSError, ValueError, TypeError):
+        return {}
 
 
-def save_settings(data: dict):
-    with open(SETTINGS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+def save_settings(data: dict[str, Any]) -> None:
+    """Atomically persist opted-in settings with owner-only permissions where possible."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    clean = {key: data[key] for key in PERSISTED_SETTING_KEYS if key in data}
+    fd, temporary = tempfile.mkstemp(prefix=".settings-", suffix=".json", dir=DATA_DIR)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(clean, f, indent=2)
+        try:
+            os.chmod(temporary, 0o600)
+        except OSError:
+            pass
+        os.replace(temporary, SETTINGS_FILE)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def clear_settings() -> None:
+    try:
+        SETTINGS_FILE.unlink()
+    except FileNotFoundError:
+        pass
 
 
 @app.on_event("startup")
 async def startup():
-    s = load_settings()
-    if s:
-        engine.configure(**{k: v for k, v in s.items() if k != "remember"})
-    # env fallback
-    envf = os.path.join(ROOT, ".env")
-    if not s and os.path.exists(envf):
+    # Broker credentials are intentionally supplied through the Account & Risk
+    # screen. We never read IQ Option credentials from .env or Render env vars.
+    settings = load_settings()
+    if settings:
         try:
-            from dotenv import dotenv_values
-            c = dotenv_values(envf)
-            engine.configure(
-                email=c.get("EMAIL"), password=c.get("PASSWORD"),
-                account_type=(c.get("ACCOUNT_TYPE") or "PRACTICE"),
-                active_id=int(c.get("ACTIVE_ID") or 1),
-                amount=float(c.get("TRADE_AMOUNT") or 1),
-                expiration=int(c.get("EXPIRATION_SECONDS") or 60),
-                max_concurrent_trades=int(c.get("MAX_CONCURRENT_TRADES") or 1),
-                active_name=assets_mod.name_for(int(c.get("ACTIVE_ID") or 1)),
-            )
-        except Exception:
-            pass
+            engine.configure(**settings)
+        except (TypeError, ValueError):
+            engine.log("Saved settings could not be loaded.", "warn")
+    if _dashboard_password():
+        engine.log("Dashboard access protection is enabled.", "success")
+    elif _auth_required():
+        engine.log("Dashboard password is required but not configured.", "error")
+    else:
+        engine.log("Dashboard is public. Set DASHBOARD_PASSWORD before deploying.", "warn")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    engine.disconnect()
 
 
 # ----------------------------------------------------------------------
-# models
+# Input models
 # ----------------------------------------------------------------------
 class AccountIn(BaseModel):
-    email: str | None = None
-    password: str | None = None
+    email: str | None = Field(default=None, max_length=320)
+    password: str | None = Field(default=None, max_length=512)
     account_type: str | None = None
     trade_type: str | None = None
     active_id: int | None = None
-    amount: float | None = None
-    expiration: int | None = None
-    max_concurrent_trades: int | None = None
+    amount: float | None = Field(default=None, gt=0, le=1_000_000)
+    expiration: int | None = Field(default=None, ge=5, le=86_400)
+    max_concurrent_trades: int | None = Field(default=None, ge=1, le=10)
     remember: bool = True
 
 
 class TradeIn(BaseModel):
     direction: str
-    amount: float | None = None
-    expiration: int | None = None
+    amount: float | None = Field(default=None, gt=0, le=1_000_000)
+    expiration: int | None = Field(default=None, ge=5, le=86_400)
 
 
 class AssetIn(BaseModel):
@@ -94,7 +257,7 @@ class AssetIn(BaseModel):
 
 
 class TFIn(BaseModel):
-    timeframe: int
+    timeframe: int = Field(ge=5, le=86_400)
 
 
 class AutoIn(BaseModel):
@@ -102,27 +265,68 @@ class AutoIn(BaseModel):
 
 
 class StrategyIn(BaseModel):
-    name: str | None = None
-    code: str | None = None
-    filename: str | None = None
+    name: str | None = Field(default=None, max_length=100)
+    code: str | None = Field(default=None, max_length=250_000)
+    filename: str | None = Field(default=None, max_length=100)
 
 
 class BacktestIn(BaseModel):
-    strategy: str
-    dataset: str
-    expiration: int = 60
-    payout: float = 0.80
-    stake: float = 1.0
+    strategy: str = Field(min_length=1, max_length=100)
+    dataset: str = Field(min_length=1, max_length=255)
+    expiration: int = Field(default=60, ge=5, le=86_400)
+    payout: float = Field(default=0.80, gt=0, le=1)
+    stake: float = Field(default=1.0, gt=0, le=1_000_000)
     start: str | None = None
     end: str | None = None
 
 
 # ----------------------------------------------------------------------
-# REST
+# Helpers
+# ----------------------------------------------------------------------
+def _model_data(model: BaseModel) -> dict[str, Any]:
+    """Keep the application usable with either Pydantic v1 or v2."""
+    if hasattr(model, "model_dump"):
+        return model.model_dump(exclude_none=True)  # type: ignore[attr-defined]
+    return model.dict(exclude_none=True)  # type: ignore[attr-defined]
+
+
+def _assert_account_values(data: dict[str, Any]) -> None:
+    if "account_type" in data:
+        data["account_type"] = str(data["account_type"]).upper()
+        if data["account_type"] not in {"PRACTICE", "REAL"}:
+            raise HTTPException(status_code=422, detail="Account type must be PRACTICE or REAL.")
+    if "trade_type" in data:
+        data["trade_type"] = str(data["trade_type"]).lower()
+        if data["trade_type"] not in {"turbo", "binary", "digital"}:
+            raise HTTPException(status_code=422, detail="Unsupported trade type.")
+    if "active_id" in data and int(data["active_id"]) not in assets_mod.BY_ID:
+        raise HTTPException(status_code=422, detail="Unknown asset.")
+
+
+def _strategy_path(strategy_id: str) -> Path | None:
+    if strategy_id.startswith("user:"):
+        filename = strategy_id[5:]
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,79}\.py", filename):
+            return None
+        return USER_STRATS / filename
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,79}", strategy_id):
+        return None
+    return ROOT / "strategies" / f"{strategy_id}.py"
+
+
+def _require_strategy(strategy_id: str) -> Path:
+    path = _strategy_path(strategy_id)
+    if path is None or not path.is_file():
+        raise HTTPException(status_code=404, detail="Strategy not found.")
+    return path
+
+
+# ----------------------------------------------------------------------
+# REST API
 # ----------------------------------------------------------------------
 @app.get("/api/state")
 def get_state():
-    return engine.snapshot()
+    return {**engine.snapshot(), "auth_enabled": _auth_required(), "storage_path": str(DATA_DIR)}
 
 
 @app.get("/api/assets")
@@ -132,24 +336,32 @@ def get_assets():
 
 @app.post("/api/account")
 def set_account(body: AccountIn):
-    data = body.model_dump(exclude_none=True)
+    data = _model_data(body)
     remember = data.pop("remember", True)
+    _assert_account_values(data)
     if "active_id" in data:
         data["active_name"] = assets_mod.name_for(data["active_id"])
     engine.configure(**data)
     if data.get("account_type"):
         engine.switch_balance(data["account_type"])
+
     if remember:
         stored = load_settings()
         stored.update(data)
         save_settings(stored)
-    return {"ok": True, "state": engine.snapshot()}
+    else:
+        # Explicitly opt out: never leave a prior password in an ephemeral or
+        # persistent Render filesystem after the user unchecks Remember.
+        clear_settings()
+    return {"ok": True, "state": engine.snapshot(), "remembered": bool(remember)}
 
 
 @app.post("/api/connect")
 def connect():
     ok = engine.connect()
-    return {"ok": ok}
+    if not ok:
+        raise HTTPException(status_code=400, detail="Could not start the IQ Option connection. Check account settings and logs.")
+    return {"ok": True}
 
 
 @app.post("/api/disconnect")
@@ -160,6 +372,8 @@ def disconnect():
 
 @app.post("/api/asset")
 def set_asset(body: AssetIn):
+    if body.active_id not in assets_mod.BY_ID:
+        raise HTTPException(status_code=404, detail="Asset not found.")
     engine.switch_asset(body.active_id, assets_mod.name_for(body.active_id))
     return {"ok": True}
 
@@ -172,13 +386,20 @@ def set_tf(body: TFIn):
 
 @app.post("/api/trade")
 def trade(body: TradeIn):
+    if str(body.direction).lower() not in {"call", "put", "buy", "sell", "up", "down"}:
+        raise HTTPException(status_code=422, detail="Direction must be CALL or PUT.")
     ok = engine.place_trade(body.direction, body.amount, body.expiration, source="manual")
-    return {"ok": ok}
+    if not ok:
+        raise HTTPException(status_code=409, detail="Trade was not submitted. Check the connection, balance, and active-trade limit.")
+    return {"ok": True}
 
 
 @app.post("/api/auto")
 def auto(body: AutoIn):
-    return {"ok": engine.set_auto(body.enabled)}
+    ok = engine.set_auto(body.enabled)
+    if not ok:
+        raise HTTPException(status_code=409, detail="Load a strategy and connect before enabling auto trading.")
+    return {"ok": True}
 
 
 @app.post("/api/reset-stats")
@@ -190,96 +411,114 @@ def reset_stats():
 @app.get("/api/strategies")
 def list_strategies():
     out = []
-    for f in sorted(os.listdir(os.path.join(ROOT, "strategies"))):
-        if f.endswith(".py") and not f.startswith("__"):
-            out.append({"id": f[:-3], "name": f[:-3], "builtin": True})
-    for f in sorted(os.listdir(USER_STRATS)):
-        if f.endswith(".py"):
-            out.append({"id": f"user:{f}", "name": f[:-3], "builtin": False})
+    builtin_dir = ROOT / "strategies"
+    for path in sorted(builtin_dir.glob("*.py")):
+        if not path.name.startswith("__"):
+            out.append({"id": path.stem, "name": path.stem.replace("_", " ").title(), "builtin": True})
+    for path in sorted(USER_STRATS.glob("*.py")):
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,79}\.py", path.name):
+            out.append({"id": f"user:{path.name}", "name": path.stem.replace("_", " ").title(), "builtin": False})
     return out
 
 
 @app.get("/api/strategy-source")
 def strategy_source(id: str):
-    path = _strategy_path(id)
-    if not path or not os.path.exists(path):
-        return JSONResponse({"error": "not found"}, status_code=404)
-    with open(path) as f:
-        return {"id": id, "code": f.read()}
-
-
-def _strategy_path(sid: str) -> str | None:
-    if sid.startswith("user:"):
-        return os.path.join(USER_STRATS, os.path.basename(sid[5:]))
-    return os.path.join(ROOT, "strategies", os.path.basename(sid) + ".py")
+    path = _require_strategy(id)
+    try:
+        return {"id": id, "code": path.read_text(encoding="utf-8")}
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not read strategy: {exc}") from exc
 
 
 @app.post("/api/strategy/save")
 def save_strategy(body: StrategyIn):
     if not body.code or not body.filename:
-        return JSONResponse({"error": "filename and code required"}, status_code=400)
-    fname = os.path.basename(body.filename)
-    if not fname.endswith(".py"):
-        fname += ".py"
-    path = os.path.join(USER_STRATS, fname)
-    with open(path, "w") as f:
-        f.write(body.code)
-    # validate
-    try:
-        from .engine import StrategyRunner
-        r = StrategyRunner(source_path=path)
-        tfs = r.required_timeframes()
-    except Exception as e:
-        return JSONResponse(
-            {"error": f"Strategy failed to load: {e}", "trace": traceback.format_exc(limit=3)},
-            status_code=400,
+        raise HTTPException(status_code=400, detail="Filename and code are required.")
+    filename = body.filename.strip()
+    if not filename.endswith(".py"):
+        filename += ".py"
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,79}\.py", filename):
+        raise HTTPException(
+            status_code=422,
+            detail="Use a filename starting with a letter and containing only letters, numbers, and underscores.",
         )
-    return {"ok": True, "id": f"user:{fname}", "timeframes": tfs}
+
+    path = USER_STRATS / filename
+    temporary_path: str | None = None
+    try:
+        # Keep a .py suffix: importlib chooses a loader from the suffix when
+        # StrategyRunner validates the temporary source file.
+        fd, temporary_path = tempfile.mkstemp(prefix=f".{filename}.", suffix=".py", dir=USER_STRATS)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(body.code)
+        runner = StrategyRunner(source_path=temporary_path)
+        timeframes = runner.required_timeframes()
+        os.replace(temporary_path, path)
+        temporary_path = None
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Strategy failed to load: {exc}",
+            headers={"X-Strategy-Error": "validation-failed"},
+        ) from exc
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+
+    return {"ok": True, "id": f"user:{filename}", "timeframes": timeframes}
 
 
 @app.post("/api/strategy/load")
 def load_strategy(body: StrategyIn):
     if not body.name:
-        return JSONResponse({"error": "name required"}, status_code=400)
+        raise HTTPException(status_code=400, detail="Strategy name is required.")
     try:
+        path = _require_strategy(body.name)
         if body.name.startswith("user:"):
-            path = _strategy_path(body.name)
-            tfs = engine.load_strategy(source_path=path, label=os.path.basename(path)[:-3])
+            timeframes = engine.load_strategy(source_path=str(path), label=path.stem)
         else:
-            tfs = engine.load_strategy(module_name=body.name, label=body.name)
-        return {"ok": True, "timeframes": tfs}
-    except Exception as e:
-        engine.log(f"Strategy load failed: {e}", "error")
-        return JSONResponse({"error": str(e)}, status_code=400)
+            timeframes = engine.load_strategy(module_name=path.stem, label=path.stem)
+        return {"ok": True, "timeframes": timeframes}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        engine.log(f"Strategy load failed: {exc}", "error")
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/datasets")
 def datasets():
-    return backtester.list_datasets(ROOT)
+    return backtester.list_datasets(str(ROOT))
 
 
 @app.post("/api/backtest")
 def run_backtest(body: BacktestIn):
-    ds = os.path.join(ROOT, os.path.basename(body.dataset))
-    if not os.path.exists(ds):
-        return JSONResponse({"error": "dataset not found"}, status_code=404)
-    tf = 60
-    for part in os.path.basename(ds).replace(".csv", "").split("_"):
+    dataset_name = os.path.basename(body.dataset)
+    if dataset_name != body.dataset:
+        raise HTTPException(status_code=422, detail="Invalid dataset name.")
+    dataset_path = ROOT / dataset_name
+    if not dataset_path.is_file() or not dataset_name.startswith("candles_asset_") or not dataset_name.endswith(".csv"):
+        raise HTTPException(status_code=404, detail="Dataset not found.")
+
+    strategy_path = _require_strategy(body.strategy)
+    timeframe = 60
+    for part in dataset_name.removesuffix(".csv").split("_"):
         if part.endswith("s") and part[:-1].isdigit():
-            tf = int(part[:-1])
+            timeframe = int(part[:-1])
     try:
-        kw = dict(dataset_path=ds, expiration=body.expiration, payout=body.payout,
-                  stake=body.stake, start=body.start, end=body.end, timeframe=tf,
-                  label=body.strategy.replace("user:", ""))
-        if body.strategy.startswith("user:"):
-            res = backtester.run(strategy_path=_strategy_path(body.strategy), **kw)
-        else:
-            res = backtester.run(strategy_module=body.strategy, **kw)
-        return res
-    except Exception as e:
-        return JSONResponse(
-            {"error": str(e), "trace": traceback.format_exc(limit=3)}, status_code=400
+        options = dict(
+            dataset_path=str(dataset_path), expiration=body.expiration, payout=body.payout,
+            stake=body.stake, start=body.start, end=body.end, timeframe=timeframe,
+            label=strategy_path.stem,
         )
+        if body.strategy.startswith("user:"):
+            return backtester.run(strategy_path=str(strategy_path), **options)
+        return backtester.run(strategy_module=strategy_path.stem, **options)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        engine.log(f"Backtest failed: {exc}\n{traceback.format_exc(limit=3)}", "error")
+        raise HTTPException(status_code=500, detail="Backtest failed. Check strategy compatibility and server logs.") from exc
 
 
 # ----------------------------------------------------------------------
@@ -287,40 +526,46 @@ def run_backtest(body: BacktestIn):
 # ----------------------------------------------------------------------
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
+    if _auth_required() and not _is_valid_session(ws.cookies.get(SESSION_COOKIE)):
+        await ws.close(code=1008, reason="Dashboard authentication required")
+        return
+
     await ws.accept()
-    q = bus.subscribe()
+    queue = bus.subscribe()
     try:
-        await ws.send_json({"type": "state", "ts": int(time.time() * 1000),
-                            "data": engine.snapshot()})
-        for evt in bus.history()[-80:]:
-            await ws.send_json(evt)
-        tf = engine.chart_timeframe
-        if engine.candles.get(tf):
-            await ws.send_json({"type": "candles_snapshot", "ts": int(time.time() * 1000),
-                                "data": {"timeframe": tf, "active_name": engine.active_name,
-                                         "candles": engine.candles[tf][-300:],
-                                         "markers": engine.markers[-100:]}})
+        await ws.send_json({"type": "state", "ts": int(time.time() * 1000), "data": engine.snapshot()})
+        for event in bus.history()[-80:]:
+            await ws.send_json(event)
+        timeframe = engine.chart_timeframe
+        if engine.candles.get(timeframe):
+            await ws.send_json({
+                "type": "candles_snapshot",
+                "ts": int(time.time() * 1000),
+                "data": {
+                    "timeframe": timeframe,
+                    "active_name": engine.active_name,
+                    "candles": engine.candles[timeframe][-300:],
+                    "markers": engine.markers[-100:],
+                },
+            })
         while True:
             sent = False
-            while q:
-                await ws.send_json(q.popleft())
+            while queue:
+                await ws.send_json(queue.popleft())
                 sent = True
-            if not sent:
-                await asyncio.sleep(0.15)
-            else:
-                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.01 if sent else 0.15)
     except (WebSocketDisconnect, RuntimeError):
         pass
     finally:
-        bus.unsubscribe(q)
+        bus.unsubscribe(queue)
 
 
 # ----------------------------------------------------------------------
-# static
+# Static application
 # ----------------------------------------------------------------------
-app.mount("/static", StaticFiles(directory=STATIC), name="static")
+app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
 
 
 @app.get("/")
 def index():
-    return FileResponse(os.path.join(STATIC, "index.html"))
+    return FileResponse(STATIC / "index.html")
