@@ -1,2 +1,0 @@
-# Backwards-compatible alias for local web-app installs.
--r requirements.txt
